@@ -909,6 +909,688 @@ tier_get() {
 }
 
 # ============================================================================
+# BROADCASTS (READ + WRITE)
+# ============================================================================
+#
+# Scheduling and sending (including test sends) are deliberately not exposed -
+# both post real messages to real Slack channels. A human does those in Plain.
+
+# Append a value to a newline-separated accumulator, for repeatable flags.
+append_line() {
+    if [[ -z "$1" ]]; then printf '%s' "$2"; else printf '%s\n%s' "$1" "$2"; fi
+}
+
+# Turn a newline-separated accumulator into a compact JSON array.
+json_array_from_lines() {
+    printf '%s' "$1" | jq -Rn '[inputs | select(. != "")]'
+}
+
+upper() {
+    printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
+}
+
+# A broadcast's content is a serialised Tiptap document. There is no markdown or
+# HTML form of it, so plain text has to be wrapped before it can be sent. Blank
+# lines separate paragraphs.
+tiptap_doc_from_text() {
+    jq -cn --arg text "$1" '{
+        type: "doc",
+        content: ($text | split("\n\n") | map(select(. != "") | {type: "paragraph", content: [{type: "text", text: .}]}))
+    }'
+}
+
+read_json_file() {
+    local path="$1"
+    if [[ ! -f "$path" ]]; then
+        echo "Error: file not found: $path" >&2
+        exit 1
+    fi
+    if ! jq -e '.' "$path" >/dev/null 2>&1; then
+        echo "Error: $path is not valid JSON" >&2
+        exit 1
+    fi
+    jq -c '.' "$path"
+}
+
+read_tiptap_content_file() {
+    local path="$1"
+    local doc
+    doc=$(read_json_file "$path")
+    if ! printf '%s' "$doc" | jq -e '.type == "doc"' >/dev/null 2>&1; then
+        echo "Error: $path is not a Tiptap document (expected JSON with \"type\": \"doc\")" >&2
+        exit 1
+    fi
+    printf '%s' "$doc"
+}
+
+# Build a BroadcastAudienceFilterInput from the simple flags. Flat only - and/or/not
+# trees have to come from --filters-file.
+audience_filters_from_flags() {
+    jq -cn \
+        --argjson tenantIds "$(json_array_from_lines "$1")" \
+        --argjson tierIds "$(json_array_from_lines "$2")" \
+        --argjson audienceIds "$(json_array_from_lines "$3")" \
+        --argjson slackChannelNameContains "$(json_array_from_lines "$4")" \
+        '{tenantIds: $tenantIds, tierIds: $tierIds, audienceIds: $audienceIds, slackChannelNameContains: $slackChannelNameContains}
+         | with_entries(select(.value | length > 0))'
+}
+
+# Build a BroadcastSendTargetInput. MATCHING requires filters and ALL_TENANTS
+# rejects them, so the two never combine.
+broadcast_send_target() {
+    local all_tenants="$1"
+    local filters="$2"
+
+    if [[ "$all_tenants" == "true" ]]; then
+        if [[ "$filters" != "{}" ]]; then
+            echo "Error: --all-tenants cannot be combined with --audience/--tier/--tenant/--channel-name-contains/--filters-file" >&2
+            exit 1
+        fi
+        printf '%s' '{"scope":"ALL_TENANTS"}'
+        return
+    fi
+
+    if [[ "$filters" == "{}" ]]; then
+        printf '%s' 'null'
+        return
+    fi
+
+    jq -cn --argjson filters "$filters" '{scope: "MATCHING", filters: $filters}'
+}
+
+BROADCAST_ACTOR_FIELDS='__typename ... on UserActor { userId } ... on MachineUserActor { machineUserId } ... on SystemActor { systemId }'
+BROADCAST_SENDER_FIELDS='__typename ... on SlackBroadcastSender { user { userId } } ... on PlainWorkspaceBroadcastSender { workspace { id name } }'
+
+# BroadcastAudienceFilter is a tree, and GraphQL needs every level spelled out.
+# It nests at most two levels below the root, so three levels covers it.
+BROADCAST_FILTER_DIMENSIONS='tenantIds tierIds audienceIds slackChannelNameContains slackChannels { slackTeamId slackChannelId } tenantFields { externalFieldId stringValue booleanValue numberValue stringArrayValue userReferenceValues }'
+BROADCAST_FILTER_L2="$BROADCAST_FILTER_DIMENSIONS and { $BROADCAST_FILTER_DIMENSIONS } or { $BROADCAST_FILTER_DIMENSIONS } not { $BROADCAST_FILTER_DIMENSIONS }"
+BROADCAST_FILTER_FIELDS="$BROADCAST_FILTER_DIMENSIONS and { $BROADCAST_FILTER_L2 } or { $BROADCAST_FILTER_L2 } not { $BROADCAST_FILTER_L2 }"
+
+BROADCAST_SEND_FIELDS='id status isTest scheduledAt { iso8601 } startedAt { iso8601 } completedAt { iso8601 } deliveryCounts { pending sending sent failed total }'
+BROADCAST_DELIVERY_FIELDS='id status failureReason attempts lastAttemptedAt { iso8601 } recipient { __typename ... on SlackBroadcastSendDeliveryRecipient { slackTeamId slackChannelId slackChannelName } ... on EmailBroadcastSendDeliveryRecipient { emailAddress } }'
+
+# Deliberately no `content` - a Tiptap document is large and unreadable in a list.
+BROADCAST_SUMMARY_FIELDS="id name notificationTitle type status contentFormat isLinkUnfurlingEnabled isDeleted createdAt { iso8601 } updatedAt { iso8601 } scheduledAt { iso8601 } startedAt { iso8601 } completedAt { iso8601 } latestSend { $BROADCAST_SEND_FIELDS }"
+BROADCAST_DETAIL_FIELDS="$BROADCAST_SUMMARY_FIELDS content sender { $BROADCAST_SENDER_FIELDS } sendTarget { scope filters { $BROADCAST_FILTER_FIELDS } recipients { type slackTeamId slackChannelId } excludeRecipients { type slackTeamId slackChannelId } } reactions { emojiName count } deletedAt { iso8601 } createdBy { $BROADCAST_ACTOR_FIELDS } updatedBy { $BROADCAST_ACTOR_FIELDS }"
+
+BROADCAST_AUDIENCE_FIELDS="id name type isDeleted filters { $BROADCAST_FILTER_FIELDS } createdAt { iso8601 } updatedAt { iso8601 } deletedAt { iso8601 } createdBy { $BROADCAST_ACTOR_FIELDS } updatedBy { $BROADCAST_ACTOR_FIELDS }"
+
+BROADCAST_MUTATION_ERROR='error { message code fields { field message type } }'
+
+broadcast_list() {
+    local first=10
+    local after=""
+    local statuses=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --status) statuses=$(append_line "$statuses" "$(upper "$2")"); shift 2 ;;
+            --first) first="$2"; shift 2 ;;
+            --after) after="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local variables
+    variables=$(jq -n \
+        --argjson first "$first" \
+        --arg after "$after" \
+        --argjson statuses "$(json_array_from_lines "$statuses")" \
+        '{
+            first: $first,
+            after: (if $after == "" then null else $after end),
+            filters: (if ($statuses | length) > 0 then {statuses: $statuses} else null end)
+        }')
+
+    gql "query(\$first: Int!, \$after: String, \$filters: BroadcastsFilter) { broadcasts(filters: \$filters, first: \$first, after: \$after) { edges { cursor node { $BROADCAST_SUMMARY_FIELDS } } pageInfo { hasNextPage endCursor } } }" \
+        "$variables"
+}
+
+broadcast_get() {
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        echo "Error: broadcast_id is required" >&2
+        echo "Usage: plain-api.sh broadcast get bc_01..." >&2
+        exit 1
+    fi
+    gql "query(\$id: ID!) { broadcast(broadcastId: \$id) { $BROADCAST_DETAIL_FIELDS } }" \
+        "{\"id\": \"$id\"}"
+}
+
+broadcast_search() {
+    local name="${1:-}"
+    shift || true
+    local first=10
+    local statuses=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --status) statuses=$(append_line "$statuses" "$(upper "$2")"); shift 2 ;;
+            --first) first="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ ${#name} -lt 2 ]]; then
+        echo "Error: search term must be at least 2 characters" >&2
+        echo "Usage: plain-api.sh broadcast search \"launch\" [--status DRAFT] [--first 10]" >&2
+        exit 1
+    fi
+
+    local variables
+    variables=$(jq -n \
+        --arg name "$name" \
+        --argjson first "$first" \
+        --argjson statuses "$(json_array_from_lines "$statuses")" \
+        '{
+            name: $name,
+            first: $first,
+            filters: (if ($statuses | length) > 0 then {statuses: $statuses} else null end)
+        }')
+
+    gql "query(\$name: String!, \$first: Int!, \$filters: BroadcastsFilter) { searchBroadcasts(searchQuery: {name: \$name}, filters: \$filters, first: \$first) { edges { cursor node { $BROADCAST_SUMMARY_FIELDS } } pageInfo { hasNextPage endCursor } } }" \
+        "$variables"
+}
+
+broadcast_sends() {
+    local id=""
+    local first=20
+    local is_test="null"
+    local statuses=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --real-only) is_test="false"; shift ;;
+            --test-only) is_test="true"; shift ;;
+            --status) statuses=$(append_line "$statuses" "$(upper "$2")"); shift 2 ;;
+            --first) first="$2"; shift 2 ;;
+            '') shift ;;
+            *) id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Error: broadcast_id is required" >&2
+        echo "Usage: plain-api.sh broadcast sends bc_01... [--real-only|--test-only] [--status SENT] [--first 20]" >&2
+        exit 1
+    fi
+
+    local variables
+    variables=$(jq -n \
+        --arg id "$id" \
+        --argjson first "$first" \
+        --argjson isTest "$is_test" \
+        --argjson statuses "$(json_array_from_lines "$statuses")" \
+        '{
+            id: $id,
+            first: $first,
+            filters: (
+                {isTest: $isTest, statuses: (if ($statuses | length) > 0 then $statuses else null end)}
+                | with_entries(select(.value != null))
+                | if length > 0 then . else null end
+            )
+        }')
+
+    gql "query(\$id: ID!, \$filters: BroadcastSendsFilter, \$first: Int!) { broadcast(broadcastId: \$id) { id name status sends(filters: \$filters, first: \$first) { edges { cursor node { $BROADCAST_SEND_FIELDS } } pageInfo { hasNextPage endCursor } totalCount } } }" \
+        "$variables"
+}
+
+broadcast_deliveries() {
+    local id=""
+    local send_id=""
+    local first=50
+    local statuses=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --send) send_id="$2"; shift 2 ;;
+            --status) statuses=$(append_line "$statuses" "$(upper "$2")"); shift 2 ;;
+            --first) first="$2"; shift 2 ;;
+            '') shift ;;
+            *) id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Error: broadcast_id is required" >&2
+        echo "Usage: plain-api.sh broadcast deliveries bc_01... [--send bcs_01...] [--status FAILED] [--first 50]" >&2
+        exit 1
+    fi
+
+    local delivery_filters
+    delivery_filters=$(jq -cn --argjson statuses "$(json_array_from_lines "$statuses")" \
+        'if ($statuses | length) > 0 then {statuses: $statuses} else null end')
+
+    if [[ -z "$send_id" ]]; then
+        gql "query(\$id: ID!, \$filters: BroadcastSendDeliveriesFilter, \$first: Int!) { broadcast(broadcastId: \$id) { id name latestSend { $BROADCAST_SEND_FIELDS deliveries(filters: \$filters, first: \$first) { edges { cursor node { $BROADCAST_DELIVERY_FIELDS } } pageInfo { hasNextPage endCursor } totalCount } } } }" \
+            "$(jq -n --arg id "$id" --argjson filters "$delivery_filters" --argjson first "$first" '{id: $id, filters: $filters, first: $first}')"
+        return
+    fi
+
+    # Deliveries hang off a send, and no root query returns a send by ID. Page
+    # `sends` to the one asked for instead: take the cursor of the edge before it
+    # and ask for the single edge after that.
+    local send_page
+    send_page=$(gql 'query($id: ID!) { broadcast(broadcastId: $id) { sends(first: 100) { edges { cursor node { id } } } } }' \
+        "{\"id\": \"$id\"}")
+
+    local after
+    after=$(printf '%s' "$send_page" | jq -r --arg sendId "$send_id" '
+        (.data.broadcast.sends.edges // []) as $edges
+        | ($edges | map(.node.id) | index($sendId)) as $i
+        | if $i == null then "NOT_FOUND" elif $i == 0 then "" else $edges[$i - 1].cursor end')
+
+    if [[ "$after" == "NOT_FOUND" ]]; then
+        echo "Error: send $send_id is not among the 100 most recent sends of $id" >&2
+        exit 1
+    fi
+
+    gql "query(\$id: ID!, \$after: String, \$filters: BroadcastSendDeliveriesFilter, \$first: Int!) { broadcast(broadcastId: \$id) { id name sends(first: 1, after: \$after) { edges { node { $BROADCAST_SEND_FIELDS deliveries(filters: \$filters, first: \$first) { edges { cursor node { $BROADCAST_DELIVERY_FIELDS } } pageInfo { hasNextPage endCursor } totalCount } } } } } }" \
+        "$(jq -n --arg id "$id" --arg after "$after" --argjson filters "$delivery_filters" --argjson first "$first" \
+            '{id: $id, after: (if $after == "" then null else $after end), filters: $filters, first: $first}')"
+}
+
+broadcast_recipients() {
+    local all_tenants="false"
+    local audiences=""
+    local tiers=""
+    local tenants=""
+    local channel_names=""
+    local filters_file=""
+    local search=""
+    local first=25
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --all-tenants) all_tenants="true"; shift ;;
+            --audience) audiences=$(append_line "$audiences" "$2"); shift 2 ;;
+            --tier) tiers=$(append_line "$tiers" "$2"); shift 2 ;;
+            --tenant) tenants=$(append_line "$tenants" "$2"); shift 2 ;;
+            --channel-name-contains) channel_names=$(append_line "$channel_names" "$2"); shift 2 ;;
+            --filters-file) filters_file="$2"; shift 2 ;;
+            --search) search="$2"; shift 2 ;;
+            --first) first="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local filters
+    if [[ -n "$filters_file" ]]; then
+        filters=$(read_json_file "$filters_file")
+    else
+        filters=$(audience_filters_from_flags "$tenants" "$tiers" "$audiences" "$channel_names")
+    fi
+
+    local send_target
+    send_target=$(broadcast_send_target "$all_tenants" "$filters")
+
+    if [[ "$send_target" == "null" ]]; then
+        echo "Error: pass --all-tenants, or at least one of --audience/--tier/--tenant/--channel-name-contains/--filters-file" >&2
+        exit 1
+    fi
+
+    local variables
+    variables=$(jq -n \
+        --argjson sendTarget "$send_target" \
+        --arg search "$search" \
+        --argjson first "$first" \
+        '{
+            input: {type: "SLACK", sendTarget: $sendTarget},
+            search: (if $search == "" then null else $search end),
+            first: $first
+        }')
+
+    gql 'query($input: BroadcastSendTargetRecipientsInput!, $first: Int!, $search: String) { broadcastSendTargetRecipients(input: $input) { count emptyReason recipients(first: $first, searchQuery: $search) { edges { node { id slackTeamId slackChannelId name isEnabled isPrivate } } pageInfo { hasNextPage endCursor } } } }' \
+        "$variables"
+}
+
+broadcast_create() {
+    local name=""
+    local notification_title=""
+    local text=""
+    local content_file=""
+    local sender_type=""
+    local sender_user=""
+    local link_unfurling=""
+    local all_tenants="false"
+    local audiences=""
+    local tiers=""
+    local tenants=""
+    local channel_names=""
+    local filters_file=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name) name="$2"; shift 2 ;;
+            --notification-title) notification_title="$2"; shift 2 ;;
+            --text) text="$2"; shift 2 ;;
+            --content-file) content_file="$2"; shift 2 ;;
+            --sender-type) sender_type="$(upper "$2")"; shift 2 ;;
+            --sender-user) sender_user="$2"; shift 2 ;;
+            --link-unfurling) link_unfurling="$2"; shift 2 ;;
+            --all-tenants) all_tenants="true"; shift ;;
+            --audience) audiences=$(append_line "$audiences" "$2"); shift 2 ;;
+            --tier) tiers=$(append_line "$tiers" "$2"); shift 2 ;;
+            --tenant) tenants=$(append_line "$tenants" "$2"); shift 2 ;;
+            --channel-name-contains) channel_names=$(append_line "$channel_names" "$2"); shift 2 ;;
+            --filters-file) filters_file="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        echo "Error: --name is required" >&2
+        echo "Usage: plain-api.sh broadcast create --name \"Launch\" --text \"Body\" [--notification-title \"Title\"]" >&2
+        exit 1
+    fi
+    if [[ -z "$text" ]] && [[ -z "$content_file" ]]; then
+        echo "Error: --text or --content-file is required" >&2
+        exit 1
+    fi
+
+    local content
+    if [[ -n "$content_file" ]]; then
+        content=$(read_tiptap_content_file "$content_file")
+    else
+        content=$(tiptap_doc_from_text "$text")
+    fi
+
+    if [[ -n "$sender_user" ]] && [[ -z "$sender_type" ]]; then
+        sender_type="PLAIN_USER"
+    fi
+
+    local filters
+    if [[ -n "$filters_file" ]]; then
+        filters=$(read_json_file "$filters_file")
+    else
+        filters=$(audience_filters_from_flags "$tenants" "$tiers" "$audiences" "$channel_names")
+    fi
+
+    local send_target
+    send_target=$(broadcast_send_target "$all_tenants" "$filters")
+
+    local input
+    input=$(jq -n \
+        --arg name "$name" \
+        --arg notificationTitle "$notification_title" \
+        --arg content "$content" \
+        --arg senderType "$sender_type" \
+        --arg senderUserId "$sender_user" \
+        --arg linkUnfurling "$link_unfurling" \
+        --argjson sendTarget "$send_target" \
+        '{
+            name: $name,
+            content: $content,
+            contentFormat: "TIPTAP",
+            type: "SLACK",
+            notificationTitle: (if $notificationTitle == "" then null else $notificationTitle end),
+            senderType: (if $senderType == "" then null else $senderType end),
+            senderUserId: (if $senderUserId == "" then null else $senderUserId end),
+            isLinkUnfurlingEnabled: (if $linkUnfurling == "" then null else ($linkUnfurling == "true") end),
+            sendTarget: $sendTarget
+        }
+        | with_entries(select(.value != null))')
+
+    gql "mutation(\$input: CreateBroadcastInput!) { createBroadcast(input: \$input) { broadcast { $BROADCAST_SUMMARY_FIELDS } $BROADCAST_MUTATION_ERROR } }" \
+        "$(jq -n --argjson input "$input" '{input: $input}')"
+}
+
+broadcast_update() {
+    local id=""
+    local name=""
+    local notification_title=""
+    local set_notification_title="false"
+    local text=""
+    local content_file=""
+    local sender_type=""
+    local sender_user=""
+    local link_unfurling=""
+    local all_tenants="false"
+    local audiences=""
+    local tiers=""
+    local tenants=""
+    local channel_names=""
+    local filters_file=""
+    local set_target="false"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name) name="$2"; shift 2 ;;
+            --notification-title) notification_title="$2"; set_notification_title="true"; shift 2 ;;
+            --text) text="$2"; shift 2 ;;
+            --content-file) content_file="$2"; shift 2 ;;
+            --sender-type) sender_type="$(upper "$2")"; shift 2 ;;
+            --sender-user) sender_user="$2"; shift 2 ;;
+            --link-unfurling) link_unfurling="$2"; shift 2 ;;
+            --all-tenants) all_tenants="true"; set_target="true"; shift ;;
+            --audience) audiences=$(append_line "$audiences" "$2"); set_target="true"; shift 2 ;;
+            --tier) tiers=$(append_line "$tiers" "$2"); set_target="true"; shift 2 ;;
+            --tenant) tenants=$(append_line "$tenants" "$2"); set_target="true"; shift 2 ;;
+            --channel-name-contains) channel_names=$(append_line "$channel_names" "$2"); set_target="true"; shift 2 ;;
+            --filters-file) filters_file="$2"; set_target="true"; shift 2 ;;
+            '') shift ;;
+            *) id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Error: broadcast_id is required" >&2
+        echo "Usage: plain-api.sh broadcast update bc_01... [--name ...] [--notification-title ...] [--text ...]" >&2
+        exit 1
+    fi
+
+    local content=""
+    if [[ -n "$content_file" ]]; then
+        content=$(read_tiptap_content_file "$content_file")
+    elif [[ -n "$text" ]]; then
+        content=$(tiptap_doc_from_text "$text")
+    fi
+
+    local send_target="null"
+    if [[ "$set_target" == "true" ]]; then
+        local filters
+        if [[ -n "$filters_file" ]]; then
+            filters=$(read_json_file "$filters_file")
+        else
+            filters=$(audience_filters_from_flags "$tenants" "$tiers" "$audiences" "$channel_names")
+        fi
+        send_target=$(broadcast_send_target "$all_tenants" "$filters")
+    fi
+
+    # Every field is a wrapper input: only the ones actually passed are sent, so
+    # an omitted flag leaves the stored value alone rather than clearing it.
+    local input
+    input=$(jq -n \
+        --arg broadcastId "$id" \
+        --arg name "$name" \
+        --arg notificationTitle "$notification_title" \
+        --argjson setNotificationTitle "$set_notification_title" \
+        --arg content "$content" \
+        --arg senderType "$sender_type" \
+        --arg senderUserId "$sender_user" \
+        --arg linkUnfurling "$link_unfurling" \
+        --argjson sendTarget "$send_target" \
+        '{
+            broadcastId: $broadcastId,
+            name: (if $name == "" then null else {value: $name} end),
+            notificationTitle: (if $setNotificationTitle then {value: (if $notificationTitle == "" then null else $notificationTitle end)} else null end),
+            content: (if $content == "" then null else {value: $content} end),
+            contentFormat: (if $content == "" then null else {value: "TIPTAP"} end),
+            senderType: (if $senderType == "" then null else {value: $senderType} end),
+            senderUserId: (if $senderUserId == "" then null else {value: $senderUserId} end),
+            isLinkUnfurlingEnabled: (if $linkUnfurling == "" then null else {value: ($linkUnfurling == "true")} end),
+            sendTarget: $sendTarget
+        }
+        | with_entries(select(.value != null))')
+
+    gql "mutation(\$input: UpdateBroadcastInput!) { updateBroadcast(input: \$input) { broadcast { $BROADCAST_SUMMARY_FIELDS } $BROADCAST_MUTATION_ERROR } }" \
+        "$(jq -n --argjson input "$input" '{input: $input}')"
+}
+
+broadcast_delete() {
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        echo "Error: broadcast_id is required" >&2
+        echo "Usage: plain-api.sh broadcast delete bc_01..." >&2
+        exit 1
+    fi
+    gql "mutation(\$input: DeleteBroadcastInput!) { deleteBroadcast(input: \$input) { broadcast { id name isDeleted deletedAt { iso8601 } } $BROADCAST_MUTATION_ERROR } }" \
+        "{\"input\": {\"broadcastId\": \"$id\"}}"
+}
+
+# ============================================================================
+# BROADCAST AUDIENCES (READ + WRITE)
+# ============================================================================
+
+audience_list() {
+    local first=20
+    local search=""
+    local after=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --search) search="$2"; shift 2 ;;
+            --first) first="$2"; shift 2 ;;
+            --after) after="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local variables
+    variables=$(jq -n --argjson first "$first" --arg search "$search" --arg after "$after" \
+        '{
+            first: $first,
+            searchQuery: (if $search == "" then null else $search end),
+            after: (if $after == "" then null else $after end)
+        }')
+
+    gql "query(\$first: Int!, \$searchQuery: String, \$after: String) { broadcastAudiences(searchQuery: \$searchQuery, first: \$first, after: \$after) { edges { cursor node { $BROADCAST_AUDIENCE_FIELDS } } pageInfo { hasNextPage endCursor } } }" \
+        "$variables"
+}
+
+audience_get() {
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        echo "Error: broadcast_audience_id is required" >&2
+        echo "Usage: plain-api.sh audience get ba_01..." >&2
+        exit 1
+    fi
+    gql "query(\$id: ID!) { broadcastAudience(broadcastAudienceId: \$id) { $BROADCAST_AUDIENCE_FIELDS } }" \
+        "{\"id\": \"$id\"}"
+}
+
+audience_create() {
+    local name=""
+    local tiers=""
+    local tenants=""
+    local channel_names=""
+    local filters_file=""
+    local all_tenants="false"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name) name="$2"; shift 2 ;;
+            --tier) tiers=$(append_line "$tiers" "$2"); shift 2 ;;
+            --tenant) tenants=$(append_line "$tenants" "$2"); shift 2 ;;
+            --channel-name-contains) channel_names=$(append_line "$channel_names" "$2"); shift 2 ;;
+            --filters-file) filters_file="$2"; shift 2 ;;
+            --all-tenants) all_tenants="true"; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        echo "Error: --name is required" >&2
+        echo "Usage: plain-api.sh audience create --name \"Enterprise\" --tier tier_01... [--tenant ten_01...]" >&2
+        exit 1
+    fi
+
+    local filters
+    if [[ -n "$filters_file" ]]; then
+        filters=$(read_json_file "$filters_file")
+    else
+        filters=$(audience_filters_from_flags "$tenants" "$tiers" "" "$channel_names")
+    fi
+
+    # An audience with no filters at all means every tenant, which is the only way
+    # to say so. --all-tenants makes that explicit rather than accidental.
+    if [[ "$filters" == "{}" ]] && [[ "$all_tenants" != "true" ]]; then
+        echo "Error: pass --all-tenants to mean every tenant, or one of --tier/--tenant/--channel-name-contains/--filters-file" >&2
+        exit 1
+    fi
+
+    local input
+    input=$(jq -n --arg name "$name" --argjson filters "$filters" \
+        '{name: $name, type: "SLACK", filters: $filters}')
+
+    gql "mutation(\$input: CreateBroadcastAudienceInput!) { createBroadcastAudience(input: \$input) { broadcastAudience { $BROADCAST_AUDIENCE_FIELDS } $BROADCAST_MUTATION_ERROR } }" \
+        "$(jq -n --argjson input "$input" '{input: $input}')"
+}
+
+audience_update() {
+    local id=""
+    local name=""
+    local tiers=""
+    local tenants=""
+    local channel_names=""
+    local filters_file=""
+    local set_filters="false"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name) name="$2"; shift 2 ;;
+            --tier) tiers=$(append_line "$tiers" "$2"); set_filters="true"; shift 2 ;;
+            --tenant) tenants=$(append_line "$tenants" "$2"); set_filters="true"; shift 2 ;;
+            --channel-name-contains) channel_names=$(append_line "$channel_names" "$2"); set_filters="true"; shift 2 ;;
+            --filters-file) filters_file="$2"; set_filters="true"; shift 2 ;;
+            '') shift ;;
+            *) id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Error: broadcast_audience_id is required" >&2
+        echo "Usage: plain-api.sh audience update ba_01... [--name \"New name\"] [--tier tier_01...]" >&2
+        exit 1
+    fi
+
+    # Filters replace the stored tree wholesale - there is no merge. Read the
+    # audience first and pass the whole thing back if you only mean to add one row.
+    local filters="null"
+    if [[ "$set_filters" == "true" ]]; then
+        if [[ -n "$filters_file" ]]; then
+            filters=$(read_json_file "$filters_file")
+        else
+            filters=$(audience_filters_from_flags "$tenants" "$tiers" "" "$channel_names")
+        fi
+    fi
+
+    local input
+    input=$(jq -n --arg broadcastAudienceId "$id" --arg name "$name" --argjson filters "$filters" \
+        '{
+            broadcastAudienceId: $broadcastAudienceId,
+            name: (if $name == "" then null else {value: $name} end),
+            filters: $filters
+        }
+        | with_entries(select(.value != null))')
+
+    gql "mutation(\$input: UpdateBroadcastAudienceInput!) { updateBroadcastAudience(input: \$input) { broadcastAudience { $BROADCAST_AUDIENCE_FIELDS } $BROADCAST_MUTATION_ERROR } }" \
+        "$(jq -n --argjson input "$input" '{input: $input}')"
+}
+
+audience_delete() {
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        echo "Error: broadcast_audience_id is required" >&2
+        echo "Usage: plain-api.sh audience delete ba_01..." >&2
+        exit 1
+    fi
+    gql "mutation(\$input: DeleteBroadcastAudienceInput!) { deleteBroadcastAudience(input: \$input) { broadcastAudience { id name isDeleted deletedAt { iso8601 } } $BROADCAST_MUTATION_ERROR } }" \
+        "{\"input\": {\"broadcastAudienceId\": \"$id\"}}"
+}
+
+# ============================================================================
 # WORKSPACE (READ ONLY)
 # ============================================================================
 
@@ -933,6 +1615,8 @@ RESOURCES:
   tenant        Read tenants
   label         Read labels
   helpcenter    Read + create draft articles and groups
+  broadcast     Read + draft broadcasts (never schedules or sends)
+  audience      Read + write broadcast audiences
   tier          Read tiers and SLAs
   workspace     Get workspace info
 
@@ -954,8 +1638,23 @@ EXAMPLES:
   plain-api.sh helpcenter articles hc_123 --first 10
   plain-api.sh helpcenter article upsert hc_123 --title "Title" --content "<p>HTML</p>"
 
+  plain-api.sh broadcast list --status DRAFT
+  plain-api.sh broadcast get bc_123
+  plain-api.sh broadcast sends bc_123 --real-only
+  plain-api.sh broadcast deliveries bc_123 --status FAILED
+  plain-api.sh broadcast recipients --tier tier_123
+  plain-api.sh broadcast create --name "Launch" --text "We shipped it." --notification-title "We shipped it"
+
+  plain-api.sh audience list --search enterprise
+  plain-api.sh audience create --name "Enterprise" --tier tier_123
+  plain-api.sh audience update ba_123 --name "Enterprise (EU)"
+
   plain-api.sh tier list
   plain-api.sh workspace
+
+NOTE:
+  Scheduling and sending broadcasts (including test sends) are not exposed.
+  Both post real messages to real Slack channels - do those in the Plain app.
 
 ENVIRONMENT:
   PLAIN_API_KEY   Required. Your Plain API key.
@@ -1069,6 +1768,37 @@ main() {
                     esac
                     ;;
                 *) echo "Unknown helpcenter action: $action" >&2; exit 1 ;;
+            esac
+            ;;
+        broadcast)
+            local action="${1:-list}"
+            shift || true
+            case "$action" in
+                list) broadcast_list "$@" ;;
+                get) broadcast_get "$@" ;;
+                search) broadcast_search "$@" ;;
+                sends) broadcast_sends "$@" ;;
+                deliveries) broadcast_deliveries "$@" ;;
+                recipients) broadcast_recipients "$@" ;;
+                create) broadcast_create "$@" ;;
+                update) broadcast_update "$@" ;;
+                delete) broadcast_delete "$@" ;;
+                send|schedule|test)
+                    echo "Error: broadcasts are not sent or scheduled from this skill - do it in the Plain app" >&2
+                    exit 1 ;;
+                *) echo "Unknown broadcast action: $action" >&2; exit 1 ;;
+            esac
+            ;;
+        audience)
+            local action="${1:-list}"
+            shift || true
+            case "$action" in
+                list) audience_list "$@" ;;
+                get) audience_get "$@" ;;
+                create) audience_create "$@" ;;
+                update) audience_update "$@" ;;
+                delete) audience_delete "$@" ;;
+                *) echo "Unknown audience action: $action" >&2; exit 1 ;;
             esac
             ;;
         tier)

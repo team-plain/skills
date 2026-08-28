@@ -1,17 +1,17 @@
 ---
 name: plain-support
-description: Access to Plain customer support platform. Read customers, threads, timeline, and help center content. Add notes to threads. Create, update, and publish help center articles.
+description: Access to Plain customer support platform. Read customers, threads, timeline, help center content, and broadcasts. Add notes to threads. Create, update, and publish help center articles. Draft broadcasts and manage broadcast audiences.
 license: MIT
 compatibility: Requires curl, jq, and PLAIN_API_KEY environment variable
 metadata:
   author: plain
-  version: "2.2"
+  version: "2.3"
 allowed-tools: Bash Read
 ---
 
 # Plain API Skill
 
-Access to the Plain customer support platform via GraphQL API. This skill provides commands to read customers, support threads, timeline entries, help center content, and more. Notes can be added to threads. Help center articles can be created, updated, and published directly.
+Access to the Plain customer support platform via GraphQL API. This skill provides commands to read customers, support threads, timeline entries, help center content, broadcasts, and more. Notes can be added to threads. Help center articles can be created, updated, and published directly. Broadcasts and broadcast audiences can be drafted and edited, but never scheduled or sent.
 
 ## Prerequisites
 
@@ -234,6 +234,98 @@ scripts/plain-api.sh helpcenter group delete hcag_01ABC...
 }
 ```
 
+### Broadcasts (Read + Write)
+
+A broadcast is one message posted to many Slack channels at once. This skill drafts and inspects
+them. **It never schedules or sends** — including test sends, which post real messages to real
+channels. A human does that in the Plain app.
+
+```bash
+# List broadcasts (newest first)
+scripts/plain-api.sh broadcast list --first 10
+scripts/plain-api.sh broadcast list --status DRAFT
+scripts/plain-api.sh broadcast list --status SENT --status PARTIALLY_SENT
+
+# Get one broadcast, including content, sender and send target
+scripts/plain-api.sh broadcast get bc_01ABC...
+
+# Search by name (2+ characters)
+scripts/plain-api.sh broadcast search "launch"
+
+# Send history. Unfiltered this includes test sends — check isTest
+scripts/plain-api.sh broadcast sends bc_01ABC... --real-only
+
+# Per-recipient results for the latest real send
+scripts/plain-api.sh broadcast deliveries bc_01ABC... --status FAILED
+scripts/plain-api.sh broadcast deliveries bc_01ABC... --send bcs_01ABC...
+
+# Preview who a target reaches right now, before drafting anything
+scripts/plain-api.sh broadcast recipients --tier tier_01ABC...
+scripts/plain-api.sh broadcast recipients --audience ba_01ABC... --search eng
+scripts/plain-api.sh broadcast recipients --all-tenants
+
+# Draft a broadcast (stays in DRAFT — nothing is sent)
+scripts/plain-api.sh broadcast create \
+  --name "March launch" \
+  --notification-title "We shipped bulk actions" \
+  --text "Bulk actions are live today." \
+  --tier tier_01ABC...
+
+# Edit a draft. Omitted flags are left alone, not cleared
+scripts/plain-api.sh broadcast update bc_01ABC... --name "March launch (EU)"
+scripts/plain-api.sh broadcast update bc_01ABC... --content-file /tmp/broadcast.json
+
+# Soft-delete
+scripts/plain-api.sh broadcast delete bc_01ABC...
+```
+
+**Broadcast create/update options:**
+| Option | Required | Description |
+|--------|----------|-------------|
+| `--name` | Yes (create) | Internal name. Never shown to recipients |
+| `--text` | Yes* | Plain text body, wrapped into a Tiptap document for you |
+| `--content-file` | Yes* | Path to a Tiptap document (JSON with `"type": "doc"`) |
+| `--notification-title` | No | What recipients see in the notification. Required before a human can send |
+| `--sender-type` | No | `PLAIN_WORKSPACE` or `PLAIN_USER` (implied by `--sender-user`) |
+| `--sender-user` | No | User ID to post as |
+| `--link-unfurling` | No | `true` or `false` |
+| `--all-tenants` | No | Target every tenant with a connected channel |
+| `--tier` / `--tenant` / `--audience` / `--channel-name-contains` | No | Target dimensions. Repeatable, and they combine |
+| `--filters-file` | No | A filter tree with `and`/`or`/`not`, for anything the flags cannot express |
+
+*On create, either `--text` or `--content-file` is required. There is no markdown or HTML form of a
+broadcast body — see [references/ENTITIES.md](references/ENTITIES.md).
+
+### Broadcast Audiences (Read + Write)
+
+A saved, reusable set of recipients. Resolved to channels at send time, so it stays current as
+tenants and channels change.
+
+```bash
+# List audiences
+scripts/plain-api.sh audience list --first 20
+scripts/plain-api.sh audience list --search enterprise
+
+# Get one
+scripts/plain-api.sh audience get ba_01ABC...
+
+# Create
+scripts/plain-api.sh audience create --name "Enterprise" --tier tier_01ABC...
+scripts/plain-api.sh audience create --name "Support channels" --channel-name-contains "-support"
+scripts/plain-api.sh audience create --name "Everyone" --all-tenants
+
+# Rename, or replace the filters
+scripts/plain-api.sh audience update ba_01ABC... --name "Enterprise (EU)"
+scripts/plain-api.sh audience update ba_01ABC... --filters-file /tmp/filters.json
+
+# Soft-delete (rejected while a broadcast targeting it is scheduled or sending)
+scripts/plain-api.sh audience delete ba_01ABC...
+```
+
+**Warning:** `audience update` with any filter flag **replaces** the stored filters wholesale — there
+is no merge. Run `audience get` first and pass the whole tree back if you only mean to add a row.
+Editing an audience also changes who every broadcast using it will reach on its next send.
+
 ### Tiers & SLAs (Read Only)
 
 ```bash
@@ -287,6 +379,16 @@ scripts/plain-api.sh workspace
    ```
 4. Use the returned link to view/edit in Plain UI
 
+### Draft a broadcast for a tier
+
+1. Find the tier: `tier list`
+2. Save the audience (optional, but reusable): `audience create --name "Enterprise" --tier tier_...`
+3. Check who it reaches before writing anything: `broadcast recipients --audience ba_...` — read
+   `count`, and `emptyReason` if it is zero
+4. Draft it: `broadcast create --name "..." --notification-title "..." --text "..." --audience ba_...`
+5. Confirm the draft: `broadcast get bc_...` (status stays `DRAFT`)
+6. Hand the broadcast ID to a human — scheduling and sending happen in the Plain app
+
 ## Entity Reference
 
 See [references/ENTITIES.md](references/ENTITIES.md) for detailed documentation on all entities including:
@@ -298,6 +400,9 @@ See [references/ENTITIES.md](references/ENTITIES.md) for detailed documentation 
 - Label and LabelType definitions
 - Help Center, Article, and ArticleGroup schemas
 - Tier and SLA configurations
+- Broadcast fields, statuses, and the Tiptap content format
+- BroadcastSend and delivery statuses, including failure reasons
+- BroadcastAudience filter trees and send targets
 
 ## Environment Variables
 
