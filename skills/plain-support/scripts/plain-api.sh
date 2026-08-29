@@ -929,6 +929,16 @@ upper() {
     printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
 
+# Boolean flags are compared against "true", so an unrecognised value would
+# quietly mean false. Reject it instead.
+parse_bool() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        true) printf 'true' ;;
+        false) printf 'false' ;;
+        *) echo "Error: $2 must be true or false, got '$1'" >&2; exit 1 ;;
+    esac
+}
+
 # A broadcast's content is a serialised Tiptap document. There is no markdown or
 # HTML form of it, so plain text has to be wrapped before it can be sent. Blank
 # lines separate paragraphs.
@@ -1106,6 +1116,7 @@ broadcast_sends() {
             --status) statuses=$(append_line "$statuses" "$(upper "$2")"); shift 2 ;;
             --first) first="$2"; shift 2 ;;
             '') shift ;;
+            --*) echo "Error: unknown option $1" >&2; exit 1 ;;
             *) id="$1"; shift ;;
         esac
     done
@@ -1148,6 +1159,7 @@ broadcast_deliveries() {
             --status) statuses=$(append_line "$statuses" "$(upper "$2")"); shift 2 ;;
             --first) first="$2"; shift 2 ;;
             '') shift ;;
+            --*) echo "Error: unknown option $1" >&2; exit 1 ;;
             *) id="$1"; shift ;;
         esac
     done
@@ -1268,7 +1280,7 @@ broadcast_create() {
             --content-file) content_file="$2"; shift 2 ;;
             --sender-type) sender_type="$(upper "$2")"; shift 2 ;;
             --sender-user) sender_user="$2"; shift 2 ;;
-            --link-unfurling) link_unfurling="$2"; shift 2 ;;
+            --link-unfurling) link_unfurling="$(parse_bool "$2" --link-unfurling)"; shift 2 ;;
             --all-tenants) all_tenants="true"; shift ;;
             --audience) audiences=$(append_line "$audiences" "$2"); shift 2 ;;
             --tier) tiers=$(append_line "$tiers" "$2"); shift 2 ;;
@@ -1362,7 +1374,7 @@ broadcast_update() {
             --content-file) content_file="$2"; shift 2 ;;
             --sender-type) sender_type="$(upper "$2")"; shift 2 ;;
             --sender-user) sender_user="$2"; shift 2 ;;
-            --link-unfurling) link_unfurling="$2"; shift 2 ;;
+            --link-unfurling) link_unfurling="$(parse_bool "$2" --link-unfurling)"; shift 2 ;;
             --all-tenants) all_tenants="true"; set_target="true"; shift ;;
             --audience) audiences=$(append_line "$audiences" "$2"); set_target="true"; shift 2 ;;
             --tier) tiers=$(append_line "$tiers" "$2"); set_target="true"; shift 2 ;;
@@ -1370,6 +1382,7 @@ broadcast_update() {
             --channel-name-contains) channel_names=$(append_line "$channel_names" "$2"); set_target="true"; shift 2 ;;
             --filters-file) filters_file="$2"; set_target="true"; shift 2 ;;
             '') shift ;;
+            --*) echo "Error: unknown option $1" >&2; exit 1 ;;
             *) id="$1"; shift ;;
         esac
     done
@@ -1387,6 +1400,10 @@ broadcast_update() {
         content=$(tiptap_doc_from_text "$text")
     fi
 
+    if [[ -n "$sender_user" ]] && [[ -z "$sender_type" ]]; then
+        sender_type="PLAIN_USER"
+    fi
+
     local send_target="null"
     if [[ "$set_target" == "true" ]]; then
         local filters
@@ -1396,6 +1413,12 @@ broadcast_update() {
             filters=$(audience_filters_from_flags "$tenants" "$tiers" "$audiences" "$channel_names")
         fi
         send_target=$(broadcast_send_target "$all_tenants" "$filters")
+        # Empty filters would drop sendTarget from the input and leave the stored
+        # target untouched, so the update would look like it worked and not have.
+        if [[ "$send_target" == "null" ]]; then
+            echo "Error: the target flags resolved to nothing - pass --all-tenants, or an --audience/--tier/--tenant/--channel-name-contains/--filters-file with at least one value" >&2
+            exit 1
+        fi
     fi
 
     # Every field is a wrapper input: only the ones actually passed are sent, so
@@ -1513,6 +1536,11 @@ audience_create() {
         filters=$(audience_filters_from_flags "$tenants" "$tiers" "" "$channel_names")
     fi
 
+    if [[ "$all_tenants" == "true" ]] && [[ "$filters" != "{}" ]]; then
+        echo "Error: --all-tenants cannot be combined with --tier/--tenant/--channel-name-contains/--filters-file" >&2
+        exit 1
+    fi
+
     # An audience with no filters at all means every tenant, which is the only way
     # to say so. --all-tenants makes that explicit rather than accidental.
     if [[ "$filters" == "{}" ]] && [[ "$all_tenants" != "true" ]]; then
@@ -1545,6 +1573,7 @@ audience_update() {
             --channel-name-contains) channel_names=$(append_line "$channel_names" "$2"); set_filters="true"; shift 2 ;;
             --filters-file) filters_file="$2"; set_filters="true"; shift 2 ;;
             '') shift ;;
+            --*) echo "Error: unknown option $1" >&2; exit 1 ;;
             *) id="$1"; shift ;;
         esac
     done
