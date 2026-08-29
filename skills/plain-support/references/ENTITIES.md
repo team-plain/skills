@@ -313,6 +313,169 @@ Tiers define service levels for customers/tenants, including SLA configurations.
 
 ---
 
+## Broadcast
+
+A broadcast is a message authored once and posted to many recipients at the same time. Today the
+only channel is Slack, so a broadcast becomes one Slack message per recipient channel.
+
+**Sending and scheduling are not available through this skill** — `broadcast create`/`update` draft
+the message, and a human sends it from the Plain app.
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | ID | Unique broadcast identifier (e.g., `bc_01ABC...`) |
+| `name` | String | Internal name. Never shown to recipients. This is what `broadcast search` matches on |
+| `notificationTitle` | String | What recipients see in the notification. Required before the broadcast can be sent |
+| `content` | String | The body, as a serialised Tiptap document (see below) |
+| `contentFormat` | Enum | `TIPTAP` (the only value) |
+| `type` | Enum | `SLACK` (the only value). Fixed at creation |
+| `isLinkUnfurlingEnabled` | Boolean | Whether Slack expands links and media |
+| `sender` | Union | `SlackBroadcastSender` (a user) or `PlainWorkspaceBroadcastSender` (the workspace) |
+| `sendTarget` | SendTarget | Who it reaches. Resolved to channels at send time, not when saved |
+| `status` | Enum | Lifecycle state, **derived from the latest real send** |
+| `sends` | Connection | Send history, newest first. Includes test sends unless filtered |
+| `latestSend` | BroadcastSend | The latest non-test send, which `status` comes from |
+| `reactions` | [ReactionCount] | Emoji reactions on the posted messages, totalled across channels |
+| `threads` | Connection | Threads created by replies to this broadcast |
+| `isDeleted` | Boolean | Soft-deleted. Excluded from lists and search, still fetchable by ID |
+| `scheduledAt` / `startedAt` / `completedAt` | DateTime | All come from `latestSend`, so all are null on a draft |
+
+### Content is a Tiptap document
+
+There is no markdown or HTML form of a broadcast body. `content` is a JSON string:
+
+```json
+{
+  "type": "doc",
+  "content": [
+    { "type": "paragraph", "content": [{ "type": "text", "text": "We shipped it." }] }
+  ]
+}
+```
+
+`broadcast create --text "..."` builds this for you, one paragraph per blank-line-separated block.
+Use `--content-file` when you need richer structure. Node types the Slack converter understands:
+`paragraph`, `heading`, `bulletList`, `orderedList`, `listItem`, `blockquote`, `codeBlock`,
+`horizontalRule`, `image`, `hardBreak`, and `text` with marks. Anything else is **dropped silently**
+when the broadcast is posted.
+
+### Broadcast Status
+
+Derived from the latest real send, never stored. Test sends never move it.
+
+| Status | Description |
+|--------|-------------|
+| `DRAFT` | Never scheduled. Fully editable |
+| `SCHEDULED` | A send is queued. Still editable until it starts |
+| `RESOLVING` | The send is working out which recipients it applies to |
+| `SENDING` | Delivering to recipients |
+| `SENT` | Every recipient received it |
+| `PARTIALLY_SENT` | Finished, but reached some recipients and not others |
+| `FAILED` | Finished without reaching anybody |
+| `CANCELLED` | Cancelled before it completed |
+
+---
+
+## BroadcastSend and BroadcastSendDelivery
+
+One *send* is one run of a broadcast; one *delivery* is one recipient's copy of it.
+
+### BroadcastSend Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | ID | Unique send identifier (e.g., `bcs_01ABC...`) |
+| `status` | Enum | Same values as `BroadcastStatus` minus `DRAFT` |
+| `isTest` | Boolean | **Check this.** A test send posts real messages to real channels and collects real deliveries — it is only distinguishable by this field, and it never affects the broadcast's `status` |
+| `scheduledAt` / `startedAt` / `completedAt` | DateTime | When it was due, began, and finished |
+| `deliveryCounts` | Counts | `pending`, `sending`, `sent`, `failed`, `total` — one query regardless of recipient count |
+| `deliveries` | Connection | One edge per recipient |
+
+`sends` is ordered by `scheduledAt` descending, so the first edge is **not** necessarily the send
+`status` describes. Use `latestSend` for that, or `broadcast sends <id> --real-only`.
+
+### BroadcastSendDelivery Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | ID | Unique delivery identifier (e.g., `bcsd_01ABC...`) |
+| `recipient` | Union | `SlackBroadcastSendDeliveryRecipient` (`slackTeamId`, `slackChannelId`, `slackChannelName`) or `EmailBroadcastSendDeliveryRecipient` |
+| `status` | Enum | `PENDING`, `SENDING`, `SENT`, `FAILED` |
+| `failureReason` | Enum | Why it failed. Null unless `status` is `FAILED` |
+| `attempts` | Int | How many times posting was attempted |
+| `lastAttemptedAt` | DateTime | When the last attempt started |
+
+Common `failureReason` values: `CHANNEL_NOT_CONNECTED`, `MISSING_SLACK_SCOPES`,
+`NOTIFICATION_TITLE_NOT_SET`, `SENDER_NOT_SET`, `SENDER_UNAVAILABLE`, `EMPTY_CONTENT`,
+`INVALID_CONTENT`, `INVALID_SLACK_BLOCKS`, `RATE_LIMITED`, `MAX_ATTEMPTS`, `MAX_RETRIES`,
+`EMAIL_DELIVERY_NOT_SUPPORTED`, `UNKNOWN`. Every one is terminal — anything worth retrying was
+already retried.
+
+---
+
+## BroadcastAudience
+
+A named, reusable set of recipients, resolved to concrete channels at send time rather than when it
+is saved. Editing an audience changes who every broadcast using it will reach on its next send.
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | ID | Unique audience identifier (e.g., `ba_01ABC...`) |
+| `name` | String | Internal name. Never shown to recipients |
+| `type` | Enum | `SLACK`. Fixed at creation, and must match the type of any broadcast it is attached to |
+| `filters` | Filter | What the audience selects (see below). **No rows at all means every tenant** |
+| `isDeleted` | Boolean | Soft-deleted. Excluded from lists, still fetchable by ID |
+
+### Filter tree
+
+The same shape is used by an audience's `filters` and a broadcast's `sendTarget.filters`.
+
+| Dimension | Meaning |
+|-----------|---------|
+| `tenantIds` | Specific tenants |
+| `tierIds` | Every tenant in these tiers |
+| `slackChannels` | Channels pinned by id. Nothing re-resolves these |
+| `slackChannelNameContains` | Unanchored, case-insensitive channel-name substrings, resolved at send time — so channels created or renamed later are picked up |
+| `audienceIds` | Saved audiences. Allowed on a broadcast's target, **rejected inside an audience's own filter** |
+| `and` / `or` / `not` | Nested conditions |
+
+Rules that are easy to get wrong:
+
+- Dimensions on one node **AND** together; values within one dimension **OR**.
+- An empty dimension does not constrain anything and cannot be written — omit it.
+- `and` / `or` nest at most two levels below the root; a third level is rejected.
+- `not` may name a single dimension only: no nested `and`/`or`/`not`, no second dimension.
+- `audience update --filters-file` **replaces** the stored tree wholesale. Read the audience first
+  if you only mean to add a row.
+
+### Send target
+
+| Field | Description |
+|-------|-------------|
+| `scope` | `ALL_TENANTS` (every tenant with a connected channel; rejects `filters`) or `MATCHING` (requires `filters`) |
+| `filters` | The filter tree above |
+| `recipients` | Recipients named outright, added to whatever `filters` resolved to |
+| `excludeRecipients` | Subtracted last, so a broadcast can drop one recipient without editing the audience that pulled it in |
+
+A recipient the workspace cannot reach is dropped, not errored.
+
+`broadcast recipients` previews who a target resolves to **right now**: it returns `count`, an
+`emptyReason` when the count is zero (`NO_TENANTS_MATCHED`, `NO_RECIPIENTS_RESOLVED`,
+`EXCLUDED_BY_AUDIENCE`), and the channels themselves. The number moves as tenants, tiers, tenant
+fields and connected channels change, so it is not a promise about a later send.
+
+### Permissions
+
+Broadcast commands need an API key with `broadcast:read` / `:create` / `:edit` / `:delete` and
+`broadcastAudience:read` / `:create` / `:edit` / `:delete`. A key missing one gets a permission
+error, not an empty list — do not read "no broadcasts" into it.
+
+---
+
 ## DateTime Format
 
 All datetime fields return an object with:

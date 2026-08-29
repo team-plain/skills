@@ -15,6 +15,8 @@ With this plugin, your agent can read customers, threads, conversations, help ce
 | **Tenants** | List, get | - |
 | **Labels** | List | - |
 | **Tiers & SLAs** | List, get with SLA configs | - |
+| **Broadcasts** | List, get, search, send history, per-recipient deliveries, recipient preview | Create, update, delete drafts. Never schedules or sends |
+| **Broadcast audiences** | List, get | Create, update, delete |
 | **Workspace** | Get info | - |
 
 ### Example use cases
@@ -24,6 +26,9 @@ With this plugin, your agent can read customers, threads, conversations, help ce
 - "Add a note to thread th_01ABC with my investigation findings"
 - "Create a help center article about how to reset passwords"
 - "Which customers are in the Enterprise tier?"
+- "How many channels would a broadcast to the Enterprise tier reach?"
+- "Draft a broadcast announcing bulk actions to our Enterprise tenants"
+- "Which recipients did last week's broadcast fail to reach, and why?"
 
 ## Installation
 
