@@ -328,8 +328,8 @@ the message, and a human sends it from the Plain app.
 | `id` | ID | Unique broadcast identifier (e.g., `bc_01ABC...`) |
 | `name` | String | Internal name. Never shown to recipients. This is what `broadcast search` matches on |
 | `notificationTitle` | String | What recipients see in the notification. Required before the broadcast can be sent |
-| `content` | String | The body, as a serialised Tiptap document (see below) |
-| `contentFormat` | Enum | `TIPTAP` (the only value) |
+| `content` | String | The body, encoded as declared by `contentFormat` |
+| `contentFormat` | Enum | `TIPTAP` (serialised Tiptap document; editable in the Plain app) or `SLACK_BLOCK_KIT` (JSON array of Slack blocks; **not** editable in the app) |
 | `type` | Enum | `SLACK` (the only value). Fixed at creation |
 | `isLinkUnfurlingEnabled` | Boolean | Whether Slack expands links and media |
 | `sender` | Union | `SlackBroadcastSender` (a user) or `PlainWorkspaceBroadcastSender` (the workspace) |
@@ -342,9 +342,13 @@ the message, and a human sends it from the Plain app.
 | `isDeleted` | Boolean | Soft-deleted. Excluded from lists and search, still fetchable by ID |
 | `scheduledAt` / `startedAt` / `completedAt` | DateTime | All come from `latestSend`, so all are null on a draft |
 
-### Content is a Tiptap document
+### Content encoding
 
-There is no markdown or HTML form of a broadcast body. `content` is a JSON string:
+There is no markdown or HTML form of a broadcast body. `content` is a JSON string whose shape
+depends on `contentFormat`.
+
+**Tiptap** (`broadcast create --text "..."` builds this, one paragraph per blank-line-separated
+block). Prefer this when a human will finish the draft in the Plain app:
 
 ```json
 {
@@ -355,11 +359,14 @@ There is no markdown or HTML form of a broadcast body. `content` is a JSON strin
 }
 ```
 
-`broadcast create --text "..."` builds this for you, one paragraph per blank-line-separated block.
-Use `--content-file` when you need richer structure. Node types the Slack converter understands:
-`paragraph`, `heading`, `bulletList`, `orderedList`, `listItem`, `blockquote`, `codeBlock`,
-`horizontalRule`, `image`, `hardBreak`, and `text` with marks. Anything else is **dropped silently**
-when the broadcast is posted.
+Use `--content-file` with a `{"type":"doc"}` document when you need richer Tiptap structure. Node
+types the Slack converter understands: `paragraph`, `heading`, `bulletList`, `orderedList`,
+`listItem`, `blockquote`, `codeBlock`, `horizontalRule`, `image`, `hardBreak`, and `text` with marks.
+Anything else is **dropped silently** when the broadcast is posted.
+
+**Slack Block Kit** is a JSON array of blocks, as sent to `chat.postMessage`. Pass it with
+`--content-file`. Interactive elements without a `url` do nothing (a broadcast has no listener),
+images must be publicly reachable, and the content cannot be edited in the Plain app.
 
 ### Broadcast Status
 
@@ -427,7 +434,7 @@ is saved. Editing an audience changes who every broadcast using it will reach on
 | `id` | ID | Unique audience identifier (e.g., `ba_01ABC...`) |
 | `name` | String | Internal name. Never shown to recipients |
 | `type` | Enum | `SLACK`. Fixed at creation, and must match the type of any broadcast it is attached to |
-| `filters` | Filter | What the audience selects (see below). **No rows at all means every tenant** |
+| `filters` | Filter | What the audience selects (see below). **No rows at all means every connected customer channel** |
 | `isDeleted` | Boolean | Soft-deleted. Excluded from lists, still fetchable by ID |
 
 ### Filter tree
@@ -456,7 +463,7 @@ Rules that are easy to get wrong:
 
 | Field | Description |
 |-------|-------------|
-| `scope` | `ALL_TENANTS` (every tenant with a connected channel; rejects `filters`) or `MATCHING` (requires `filters`) |
+| `scope` | `ALL_RECIPIENTS` (every connected, enabled customer channel, tenant or not; rejects `filters`) or `MATCHING` (requires `filters`) |
 | `filters` | The filter tree above |
 | `recipients` | Recipients named outright, added to whatever `filters` resolved to |
 | `excludeRecipients` | Subtracted last, so a broadcast can drop one recipient without editing the audience that pulled it in |

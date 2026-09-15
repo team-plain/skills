@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires curl, jq, and PLAIN_API_KEY environment variable
 metadata:
   author: plain
-  version: "2.3"
+  version: "2.4"
 allowed-tools: Bash Read
 ---
 
@@ -262,7 +262,7 @@ scripts/plain-api.sh broadcast deliveries bc_01ABC... --send bcs_01ABC...
 # Preview who a target reaches right now, before drafting anything
 scripts/plain-api.sh broadcast recipients --tier tier_01ABC...
 scripts/plain-api.sh broadcast recipients --audience ba_01ABC... --search eng
-scripts/plain-api.sh broadcast recipients --all-tenants
+scripts/plain-api.sh broadcast recipients --all-recipients
 
 # Draft a broadcast (stays in DRAFT — nothing is sent)
 scripts/plain-api.sh broadcast create \
@@ -283,18 +283,19 @@ scripts/plain-api.sh broadcast delete bc_01ABC...
 | Option | Required | Description |
 |--------|----------|-------------|
 | `--name` | Yes (create) | Internal name. Never shown to recipients |
-| `--text` | Yes* | Plain text body, wrapped into a Tiptap document for you |
-| `--content-file` | Yes* | Path to a Tiptap document (JSON with `"type": "doc"`) |
+| `--text` | Yes* | Plain text body, wrapped into a Tiptap document for you (editable in the Plain app) |
+| `--content-file` | Yes* | Path to a Tiptap document (`{"type":"doc"}`) or a Slack Block Kit JSON array |
 | `--notification-title` | No | What recipients see in the notification. Required before a human can send |
 | `--sender-type` | No | `PLAIN_WORKSPACE` or `PLAIN_USER` (implied by `--sender-user`) |
 | `--sender-user` | No | User ID to post as |
 | `--link-unfurling` | No | `true` or `false` |
-| `--all-tenants` | No | Target every tenant with a connected channel |
+| `--all-recipients` | No | Target every connected customer channel (`ALL_RECIPIENTS`). `--all-tenants` is accepted as an alias |
 | `--tier` / `--tenant` / `--audience` / `--channel-name-contains` | No | Target dimensions. Repeatable, and they combine |
 | `--filters-file` | No | A filter tree with `and`/`or`/`not`, for anything the flags cannot express |
 
-*On create, either `--text` or `--content-file` is required. There is no markdown or HTML form of a
-broadcast body — see [references/ENTITIES.md](references/ENTITIES.md).
+*On create, either `--text` or `--content-file` is required. `--text` is Tiptap so a human can
+finish the draft in the Plain app. A Block Kit `--content-file` cannot be edited there — see
+[references/ENTITIES.md](references/ENTITIES.md).
 
 ### Broadcast Audiences (Read + Write)
 
@@ -312,7 +313,7 @@ scripts/plain-api.sh audience get ba_01ABC...
 # Create
 scripts/plain-api.sh audience create --name "Enterprise" --tier tier_01ABC...
 scripts/plain-api.sh audience create --name "Support channels" --channel-name-contains "-support"
-scripts/plain-api.sh audience create --name "Everyone" --all-tenants
+scripts/plain-api.sh audience create --name "Everyone" --all-recipients
 
 # Rename, or replace the filters
 scripts/plain-api.sh audience update ba_01ABC... --name "Enterprise (EU)"

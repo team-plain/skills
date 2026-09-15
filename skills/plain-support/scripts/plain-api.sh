@@ -962,15 +962,25 @@ read_json_file() {
     jq -c '.' "$path"
 }
 
-read_tiptap_content_file() {
+# Reads a Tiptap document or a Slack Block Kit array. Sets BROADCAST_CONTENT_FORMAT.
+# Prefer Tiptap (--text, or a `{"type":"doc"}` file) when a human will finish the
+# draft in the Plain app: Block Kit content cannot be edited there.
+read_broadcast_content_file() {
     local path="$1"
     local doc
     doc=$(read_json_file "$path")
-    if ! printf '%s' "$doc" | jq -e '.type == "doc"' >/dev/null 2>&1; then
-        echo "Error: $path is not a Tiptap document (expected JSON with \"type\": \"doc\")" >&2
-        exit 1
+    if printf '%s' "$doc" | jq -e '.type == "doc"' >/dev/null 2>&1; then
+        BROADCAST_CONTENT_FORMAT="TIPTAP"
+        printf '%s' "$doc"
+        return
     fi
-    printf '%s' "$doc"
+    if printf '%s' "$doc" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        BROADCAST_CONTENT_FORMAT="SLACK_BLOCK_KIT"
+        printf '%s' "$doc"
+        return
+    fi
+    echo "Error: $path is not a Tiptap document (JSON with \"type\": \"doc\") or a Slack Block Kit array" >&2
+    exit 1
 }
 
 # Build a BroadcastAudienceFilterInput from the simple flags. Flat only - and/or/not
@@ -985,18 +995,18 @@ audience_filters_from_flags() {
          | with_entries(select(.value | length > 0))'
 }
 
-# Build a BroadcastSendTargetInput. MATCHING requires filters and ALL_TENANTS
+# Build a BroadcastSendTargetInput. MATCHING requires filters and ALL_RECIPIENTS
 # rejects them, so the two never combine.
 broadcast_send_target() {
-    local all_tenants="$1"
+    local all_recipients="$1"
     local filters="$2"
 
-    if [[ "$all_tenants" == "true" ]]; then
+    if [[ "$all_recipients" == "true" ]]; then
         if [[ "$filters" != "{}" ]]; then
-            echo "Error: --all-tenants cannot be combined with --audience/--tier/--tenant/--channel-name-contains/--filters-file" >&2
+            echo "Error: --all-recipients cannot be combined with --audience/--tier/--tenant/--channel-name-contains/--filters-file" >&2
             exit 1
         fi
-        printf '%s' '{"scope":"ALL_TENANTS"}'
+        printf '%s' '{"scope":"ALL_RECIPIENTS"}'
         return
     fi
 
@@ -1180,27 +1190,16 @@ broadcast_deliveries() {
         return
     fi
 
-    # Deliveries hang off a send, and no root query returns a send by ID. Page
-    # `sends` to the one asked for instead: take the cursor of the edge before it
-    # and ask for the single edge after that.
-    local send_page
-    send_page=$(gql 'query($id: ID!) { broadcast(broadcastId: $id) { sends(first: 100) { edges { cursor node { id } } } } }' \
-        "{\"id\": \"$id\"}")
+    local result
+    result=$(gql "query(\$id: ID!, \$sendFilters: BroadcastSendsFilter, \$filters: BroadcastSendDeliveriesFilter, \$first: Int!) { broadcast(broadcastId: \$id) { id name sends(filters: \$sendFilters, first: 1) { edges { node { $BROADCAST_SEND_FIELDS deliveries(filters: \$filters, first: \$first) { edges { cursor node { $BROADCAST_DELIVERY_FIELDS } } pageInfo { hasNextPage endCursor } totalCount } } } } } }" \
+        "$(jq -n --arg id "$id" --arg sendId "$send_id" --argjson filters "$delivery_filters" --argjson first "$first" \
+            '{id: $id, sendFilters: {broadcastSendIds: [$sendId]}, filters: $filters, first: $first}')")
 
-    local after
-    after=$(printf '%s' "$send_page" | jq -r --arg sendId "$send_id" '
-        (.data.broadcast.sends.edges // []) as $edges
-        | ($edges | map(.node.id) | index($sendId)) as $i
-        | if $i == null then "NOT_FOUND" elif $i == 0 then "" else $edges[$i - 1].cursor end')
-
-    if [[ "$after" == "NOT_FOUND" ]]; then
-        echo "Error: send $send_id is not among the 100 most recent sends of $id" >&2
+    if ! printf '%s' "$result" | jq -e '.data.broadcast.sends.edges[0]' >/dev/null 2>&1; then
+        echo "Error: send $send_id was not found on $id" >&2
         exit 1
     fi
-
-    gql "query(\$id: ID!, \$after: String, \$filters: BroadcastSendDeliveriesFilter, \$first: Int!) { broadcast(broadcastId: \$id) { id name sends(first: 1, after: \$after) { edges { node { $BROADCAST_SEND_FIELDS deliveries(filters: \$filters, first: \$first) { edges { cursor node { $BROADCAST_DELIVERY_FIELDS } } pageInfo { hasNextPage endCursor } totalCount } } } } } }" \
-        "$(jq -n --arg id "$id" --arg after "$after" --argjson filters "$delivery_filters" --argjson first "$first" \
-            '{id: $id, after: (if $after == "" then null else $after end), filters: $filters, first: $first}')"
+    printf '%s' "$result"
 }
 
 broadcast_recipients() {
@@ -1215,7 +1214,7 @@ broadcast_recipients() {
 
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --all-tenants) all_tenants="true"; shift ;;
+            --all-recipients|--all-tenants) all_tenants="true"; shift ;;
             --audience) audiences=$(append_line "$audiences" "$2"); shift 2 ;;
             --tier) tiers=$(append_line "$tiers" "$2"); shift 2 ;;
             --tenant) tenants=$(append_line "$tenants" "$2"); shift 2 ;;
@@ -1238,7 +1237,7 @@ broadcast_recipients() {
     send_target=$(broadcast_send_target "$all_tenants" "$filters")
 
     if [[ "$send_target" == "null" ]]; then
-        echo "Error: pass --all-tenants, or at least one of --audience/--tier/--tenant/--channel-name-contains/--filters-file" >&2
+        echo "Error: pass --all-recipients, or at least one of --audience/--tier/--tenant/--channel-name-contains/--filters-file" >&2
         exit 1
     fi
 
@@ -1281,7 +1280,7 @@ broadcast_create() {
             --sender-type) sender_type="$(upper "$2")"; shift 2 ;;
             --sender-user) sender_user="$2"; shift 2 ;;
             --link-unfurling) link_unfurling="$(parse_bool "$2" --link-unfurling)"; shift 2 ;;
-            --all-tenants) all_tenants="true"; shift ;;
+            --all-recipients|--all-tenants) all_tenants="true"; shift ;;
             --audience) audiences=$(append_line "$audiences" "$2"); shift 2 ;;
             --tier) tiers=$(append_line "$tiers" "$2"); shift 2 ;;
             --tenant) tenants=$(append_line "$tenants" "$2"); shift 2 ;;
@@ -1302,8 +1301,10 @@ broadcast_create() {
     fi
 
     local content
+    local content_format="TIPTAP"
     if [[ -n "$content_file" ]]; then
-        content=$(read_tiptap_content_file "$content_file")
+        content=$(read_broadcast_content_file "$content_file")
+        content_format="$BROADCAST_CONTENT_FORMAT"
     else
         content=$(tiptap_doc_from_text "$text")
     fi
@@ -1327,6 +1328,7 @@ broadcast_create() {
         --arg name "$name" \
         --arg notificationTitle "$notification_title" \
         --arg content "$content" \
+        --arg contentFormat "$content_format" \
         --arg senderType "$sender_type" \
         --arg senderUserId "$sender_user" \
         --arg linkUnfurling "$link_unfurling" \
@@ -1334,7 +1336,7 @@ broadcast_create() {
         '{
             name: $name,
             content: $content,
-            contentFormat: "TIPTAP",
+            contentFormat: $contentFormat,
             type: "SLACK",
             notificationTitle: (if $notificationTitle == "" then null else $notificationTitle end),
             senderType: (if $senderType == "" then null else $senderType end),
@@ -1375,7 +1377,7 @@ broadcast_update() {
             --sender-type) sender_type="$(upper "$2")"; shift 2 ;;
             --sender-user) sender_user="$2"; shift 2 ;;
             --link-unfurling) link_unfurling="$(parse_bool "$2" --link-unfurling)"; shift 2 ;;
-            --all-tenants) all_tenants="true"; set_target="true"; shift ;;
+            --all-recipients|--all-tenants) all_tenants="true"; set_target="true"; shift ;;
             --audience) audiences=$(append_line "$audiences" "$2"); set_target="true"; shift 2 ;;
             --tier) tiers=$(append_line "$tiers" "$2"); set_target="true"; shift 2 ;;
             --tenant) tenants=$(append_line "$tenants" "$2"); set_target="true"; shift 2 ;;
@@ -1394,8 +1396,10 @@ broadcast_update() {
     fi
 
     local content=""
+    local content_format="TIPTAP"
     if [[ -n "$content_file" ]]; then
-        content=$(read_tiptap_content_file "$content_file")
+        content=$(read_broadcast_content_file "$content_file")
+        content_format="$BROADCAST_CONTENT_FORMAT"
     elif [[ -n "$text" ]]; then
         content=$(tiptap_doc_from_text "$text")
     fi
@@ -1416,7 +1420,7 @@ broadcast_update() {
         # Empty filters would drop sendTarget from the input and leave the stored
         # target untouched, so the update would look like it worked and not have.
         if [[ "$send_target" == "null" ]]; then
-            echo "Error: the target flags resolved to nothing - pass --all-tenants, or an --audience/--tier/--tenant/--channel-name-contains/--filters-file with at least one value" >&2
+            echo "Error: the target flags resolved to nothing - pass --all-recipients, or an --audience/--tier/--tenant/--channel-name-contains/--filters-file with at least one value" >&2
             exit 1
         fi
     fi
@@ -1430,6 +1434,7 @@ broadcast_update() {
         --arg notificationTitle "$notification_title" \
         --argjson setNotificationTitle "$set_notification_title" \
         --arg content "$content" \
+        --arg contentFormat "$content_format" \
         --arg senderType "$sender_type" \
         --arg senderUserId "$sender_user" \
         --arg linkUnfurling "$link_unfurling" \
@@ -1439,7 +1444,7 @@ broadcast_update() {
             name: (if $name == "" then null else {value: $name} end),
             notificationTitle: (if $setNotificationTitle then {value: (if $notificationTitle == "" then null else $notificationTitle end)} else null end),
             content: (if $content == "" then null else {value: $content} end),
-            contentFormat: (if $content == "" then null else {value: "TIPTAP"} end),
+            contentFormat: (if $content == "" then null else {value: $contentFormat} end),
             senderType: (if $senderType == "" then null else {value: $senderType} end),
             senderUserId: (if $senderUserId == "" then null else {value: $senderUserId} end),
             isLinkUnfurlingEnabled: (if $linkUnfurling == "" then null else {value: ($linkUnfurling == "true")} end),
@@ -1518,7 +1523,7 @@ audience_create() {
             --tenant) tenants=$(append_line "$tenants" "$2"); shift 2 ;;
             --channel-name-contains) channel_names=$(append_line "$channel_names" "$2"); shift 2 ;;
             --filters-file) filters_file="$2"; shift 2 ;;
-            --all-tenants) all_tenants="true"; shift ;;
+            --all-recipients|--all-tenants) all_tenants="true"; shift ;;
             *) shift ;;
         esac
     done
@@ -1537,14 +1542,14 @@ audience_create() {
     fi
 
     if [[ "$all_tenants" == "true" ]] && [[ "$filters" != "{}" ]]; then
-        echo "Error: --all-tenants cannot be combined with --tier/--tenant/--channel-name-contains/--filters-file" >&2
+        echo "Error: --all-recipients cannot be combined with --tier/--tenant/--channel-name-contains/--filters-file" >&2
         exit 1
     fi
 
-    # An audience with no filters at all means every tenant, which is the only way
-    # to say so. --all-tenants makes that explicit rather than accidental.
+    # An audience with no filters at all means every connected customer channel,
+    # which is the only way to say so. --all-recipients makes that explicit.
     if [[ "$filters" == "{}" ]] && [[ "$all_tenants" != "true" ]]; then
-        echo "Error: pass --all-tenants to mean every tenant, or one of --tier/--tenant/--channel-name-contains/--filters-file" >&2
+        echo "Error: pass --all-recipients to mean every connected customer channel, or one of --tier/--tenant/--channel-name-contains/--filters-file" >&2
         exit 1
     fi
 
