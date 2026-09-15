@@ -962,21 +962,24 @@ read_json_file() {
     jq -c '.' "$path"
 }
 
-# Reads a Tiptap document or a Slack Block Kit array. Sets BROADCAST_CONTENT_FORMAT.
+# Reads a Tiptap document or a Slack Block Kit array into the named variables
+# (content, then format). Call this directly, not via $().
 # Prefer Tiptap (--text, or a `{"type":"doc"}` file) when a human will finish the
 # draft in the Plain app: Block Kit content cannot be edited there.
 read_broadcast_content_file() {
     local path="$1"
+    local -n __content_var="$2"
+    local -n __format_var="$3"
     local doc
     doc=$(read_json_file "$path")
     if printf '%s' "$doc" | jq -e '.type == "doc"' >/dev/null 2>&1; then
-        BROADCAST_CONTENT_FORMAT="TIPTAP"
-        printf '%s' "$doc"
+        __content_var="$doc"
+        __format_var="TIPTAP"
         return
     fi
     if printf '%s' "$doc" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        BROADCAST_CONTENT_FORMAT="SLACK_BLOCK_KIT"
-        printf '%s' "$doc"
+        __content_var="$doc"
+        __format_var="SLACK_BLOCK_KIT"
         return
     fi
     echo "Error: $path is not a Tiptap document (JSON with \"type\": \"doc\") or a Slack Block Kit array" >&2
@@ -1303,8 +1306,7 @@ broadcast_create() {
     local content
     local content_format="TIPTAP"
     if [[ -n "$content_file" ]]; then
-        content=$(read_broadcast_content_file "$content_file")
-        content_format="$BROADCAST_CONTENT_FORMAT"
+        read_broadcast_content_file "$content_file" content content_format
     else
         content=$(tiptap_doc_from_text "$text")
     fi
@@ -1398,8 +1400,7 @@ broadcast_update() {
     local content=""
     local content_format="TIPTAP"
     if [[ -n "$content_file" ]]; then
-        content=$(read_broadcast_content_file "$content_file")
-        content_format="$BROADCAST_CONTENT_FORMAT"
+        read_broadcast_content_file "$content_file" content content_format
     elif [[ -n "$text" ]]; then
         content=$(tiptap_doc_from_text "$text")
     fi
