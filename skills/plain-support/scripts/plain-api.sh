@@ -962,24 +962,23 @@ read_json_file() {
     jq -c '.' "$path"
 }
 
-# Reads a Tiptap document or a Slack Block Kit array into the named variables
-# (content, then format). Call this directly, not via $().
+# Reads a Tiptap document or a Slack Block Kit array. Sets _broadcast_content and
+# _broadcast_content_format in this shell — do not call via $(), which would
+# drop those assignments. Globals rather than namerefs so macOS Bash 3.2 works.
 # Prefer Tiptap (--text, or a `{"type":"doc"}` file) when a human will finish the
 # draft in the Plain app: Block Kit content cannot be edited there.
 read_broadcast_content_file() {
     local path="$1"
-    local -n __content_var="$2"
-    local -n __format_var="$3"
     local doc
     doc=$(read_json_file "$path")
     if printf '%s' "$doc" | jq -e '.type == "doc"' >/dev/null 2>&1; then
-        __content_var="$doc"
-        __format_var="TIPTAP"
+        _broadcast_content="$doc"
+        _broadcast_content_format="TIPTAP"
         return
     fi
     if printf '%s' "$doc" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        __content_var="$doc"
-        __format_var="SLACK_BLOCK_KIT"
+        _broadcast_content="$doc"
+        _broadcast_content_format="SLACK_BLOCK_KIT"
         return
     fi
     echo "Error: $path is not a Tiptap document (JSON with \"type\": \"doc\") or a Slack Block Kit array" >&2
@@ -1306,7 +1305,9 @@ broadcast_create() {
     local content
     local content_format="TIPTAP"
     if [[ -n "$content_file" ]]; then
-        read_broadcast_content_file "$content_file" content content_format
+        read_broadcast_content_file "$content_file"
+        content="$_broadcast_content"
+        content_format="$_broadcast_content_format"
     else
         content=$(tiptap_doc_from_text "$text")
     fi
@@ -1400,7 +1401,9 @@ broadcast_update() {
     local content=""
     local content_format="TIPTAP"
     if [[ -n "$content_file" ]]; then
-        read_broadcast_content_file "$content_file" content content_format
+        read_broadcast_content_file "$content_file"
+        content="$_broadcast_content"
+        content_format="$_broadcast_content_format"
     elif [[ -n "$text" ]]; then
         content=$(tiptap_doc_from_text "$text")
     fi
