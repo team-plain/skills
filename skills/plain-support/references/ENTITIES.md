@@ -332,6 +332,7 @@ the message, and a human sends it from the Plain app.
 | `contentFormat` | Enum | `TIPTAP` (serialised Tiptap document; editable in the Plain app) or `SLACK_BLOCK_KIT` (JSON array of Slack blocks; **not** editable in the app) |
 | `type` | Enum | `SLACK` (the only value). Fixed at creation |
 | `isLinkUnfurlingEnabled` | Boolean | Whether Slack expands links and media |
+| `appendUnsubscribeLink` | Boolean | Whether an unsubscribe link is added to the footer. **Null means inherit** the workspace default (see below) |
 | `sender` | Union | `SlackBroadcastSender` (a user) or `PlainWorkspaceBroadcastSender` (the workspace) |
 | `sendTarget` | SendTarget | Who it reaches. Resolved to channels at send time, not when saved |
 | `status` | Enum | Lifecycle state, **derived from the latest real send** |
@@ -368,6 +369,17 @@ Anything else is **dropped silently** when the broadcast is posted.
 `--content-file`. Interactive elements without a `url` do nothing (a broadcast has no listener),
 images must be publicly reachable, and the content cannot be edited in the Plain app.
 
+### Unsubscribe link
+
+Two settings decide whether a delivered broadcast has an unsubscribe link in its footer:
+
+1. The broadcast's `appendUnsubscribeLink`, when it is `true` or `false`
+2. Otherwise the workspace setting `broadcasts/append_unsubscribe_link`. It is **off by default**
+
+`broadcast get` returns the workspace value as `workspaceAppendUnsubscribeLink.booleanValue`. It is
+null, with an error beside it, when the API key lacks `setting/workspace:read`. Do not read that null
+as "off".
+
 ### Broadcast Status
 
 Derived from the latest real send, never stored. Test sends never move it.
@@ -397,7 +409,7 @@ One *send* is one run of a broadcast; one *delivery* is one recipient's copy of 
 | `status` | Enum | Same values as `BroadcastStatus` minus `DRAFT` |
 | `isTest` | Boolean | **Check this.** A test send posts real messages to real channels and collects real deliveries — it is only distinguishable by this field, and it never affects the broadcast's `status` |
 | `scheduledAt` / `startedAt` / `completedAt` | DateTime | When it was due, began, and finished |
-| `deliveryCounts` | Counts | `pending`, `sending`, `sent`, `failed`, `total` — one query regardless of recipient count |
+| `deliveryCounts` | Counts | `pending`, `sending`, `sent`, `failed`, `skippedUnsubscribed`, `total` — one query regardless of recipient count. `total` **excludes** `skippedUnsubscribed` |
 | `deliveries` | Connection | One edge per recipient |
 
 `sends` is ordered by `scheduledAt` descending, so the first edge is **not** necessarily the send
@@ -409,7 +421,7 @@ One *send* is one run of a broadcast; one *delivery* is one recipient's copy of 
 |-------|------|-------------|
 | `id` | ID | Unique delivery identifier (e.g., `bcsd_01ABC...`) |
 | `recipient` | Union | `SlackBroadcastSendDeliveryRecipient` (`slackTeamId`, `slackChannelId`, `slackChannelName`) or `EmailBroadcastSendDeliveryRecipient` |
-| `status` | Enum | `PENDING`, `SENDING`, `SENT`, `FAILED` |
+| `status` | Enum | `PENDING`, `SENDING`, `SENT`, `FAILED`, `SKIPPED_UNSUBSCRIBED` |
 | `failureReason` | Enum | Why it failed. Null unless `status` is `FAILED` |
 | `attempts` | Int | How many times posting was attempted |
 | `lastAttemptedAt` | DateTime | When the last attempt started |
@@ -419,6 +431,18 @@ Common `failureReason` values: `CHANNEL_NOT_CONNECTED`, `MISSING_SLACK_SCOPES`,
 `INVALID_CONTENT`, `INVALID_SLACK_BLOCKS`, `RATE_LIMITED`, `MAX_ATTEMPTS`, `MAX_RETRIES`,
 `EMAIL_DELIVERY_NOT_SUPPORTED`, `UNKNOWN`. Every one is terminal — anything worth retrying was
 already retried.
+
+`SKIPPED_UNSUBSCRIBED` is not a failure. The channel matched the target when the send resolved, but
+it was unsubscribed, so nothing was posted. It is terminal from the start and has no
+`failureReason`. A skipped channel alone never makes a send `PARTIALLY_SENT`.
+
+So for a channel that did not get a broadcast:
+
+| What you find | Meaning |
+|---------------|---------|
+| `SKIPPED_UNSUBSCRIBED` delivery | Matched, but the channel is unsubscribed |
+| `FAILED` delivery | Matched, and posting failed. See `failureReason` |
+| No delivery | The target never matched the channel |
 
 ---
 
@@ -472,13 +496,37 @@ A recipient the workspace cannot reach is dropped, not errored.
 
 `broadcast recipients` previews who a target resolves to **right now**: it returns `count`, an
 `emptyReason` when the count is zero (`NO_TENANTS_MATCHED`, `NO_RECIPIENTS_RESOLVED`,
-`EXCLUDED_BY_AUDIENCE`), and the channels themselves. The number moves as tenants, tiers, tenant
+`EXCLUDED_BY_AUDIENCE`, `ALL_RECIPIENTS_UNSUBSCRIBED`), and the channels themselves. Unsubscribed
+channels are already left out of `count` and the list. The number moves as tenants, tiers, tenant
 fields and connected channels change, so it is not a promise about a later send.
+
+---
+
+## BroadcastRecipientUnsubscribe
+
+One channel that has opted out of broadcasts. Every send drops it, whatever the target says.
+Unsubscribe and resubscribe are both idempotent.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | ID | Unique unsubscribe identifier |
+| `recipient` | Union | `SlackBroadcastRecipientUnsubscribeRecipient`: `slackTeamId`, `slackChannelId`, and `connectedSlackChannel` (null if the channel was disconnected since) |
+| `source` | Enum | `CUSTOMER_LINK` (the customer used the footer link), `PLAIN_USER` (someone in Plain or an API key), `BULK_IMPORT` |
+| `broadcastSendDeliveryId` | ID | The delivery whose footer link was used. Null when a Plain user unsubscribed the channel |
+| `createdAt` / `createdBy` | | When and by whom it was recorded |
+
+`broadcast unsubscribes --search` matches the connected channel name only. A channel that is no
+longer connected has no name, so search cannot find it. List without `--search` to see it.
+
+`resubscribe` returns the removed unsubscribe in `unsubscribe`, or null if the channel was not
+unsubscribed.
 
 ### Permissions
 
 Broadcast commands need an API key with `broadcast:read` / `:create` / `:edit` / `:delete` and
-`broadcastAudience:read` / `:create` / `:edit` / `:delete`. A key missing one gets a permission
+`broadcastAudience:read` / `:create` / `:edit` / `:delete`. Listing unsubscribes needs
+`broadcast:read`. Unsubscribe and resubscribe need `broadcast:edit`. Reading the workspace
+unsubscribe link default needs `setting/workspace:read`. A key missing one gets a permission
 error, not an empty list — do not read "no broadcasts" into it.
 
 ---
