@@ -939,6 +939,17 @@ parse_bool() {
     esac
 }
 
+# Like parse_bool, plus "inherit": no per-broadcast override, so the workspace
+# default decides.
+parse_bool_or_inherit() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        true) printf 'true' ;;
+        false) printf 'false' ;;
+        inherit) printf 'inherit' ;;
+        *) echo "Error: $2 must be true, false or inherit, got '$1'" >&2; exit 1 ;;
+    esac
+}
+
 # A broadcast's content is a serialised Tiptap document. There is no markdown or
 # HTML form of it, so plain text has to be wrapped before it can be sent. Blank
 # lines separate paragraphs.
@@ -1029,16 +1040,22 @@ BROADCAST_FILTER_DIMENSIONS='tenantIds tierIds audienceIds slackChannelNameConta
 BROADCAST_FILTER_L2="$BROADCAST_FILTER_DIMENSIONS and { $BROADCAST_FILTER_DIMENSIONS } or { $BROADCAST_FILTER_DIMENSIONS } not { $BROADCAST_FILTER_DIMENSIONS }"
 BROADCAST_FILTER_FIELDS="$BROADCAST_FILTER_DIMENSIONS and { $BROADCAST_FILTER_L2 } or { $BROADCAST_FILTER_L2 } not { $BROADCAST_FILTER_L2 }"
 
-BROADCAST_SEND_FIELDS='id status isTest scheduledAt { iso8601 } startedAt { iso8601 } completedAt { iso8601 } deliveryCounts { pending sending sent failed total }'
+BROADCAST_SEND_FIELDS='id status isTest scheduledAt { iso8601 } startedAt { iso8601 } completedAt { iso8601 } deliveryCounts { pending sending sent failed skippedUnsubscribed total }'
 BROADCAST_DELIVERY_FIELDS='id status failureReason attempts lastAttemptedAt { iso8601 } recipient { __typename ... on SlackBroadcastSendDeliveryRecipient { slackTeamId slackChannelId slackChannelName } ... on EmailBroadcastSendDeliveryRecipient { emailAddress } }'
 
 # Deliberately no `content` - a Tiptap document is large and unreadable in a list.
-BROADCAST_SUMMARY_FIELDS="id name notificationTitle type status contentFormat isLinkUnfurlingEnabled isDeleted createdAt { iso8601 } updatedAt { iso8601 } scheduledAt { iso8601 } startedAt { iso8601 } completedAt { iso8601 } latestSend { $BROADCAST_SEND_FIELDS }"
+BROADCAST_SUMMARY_FIELDS="id name notificationTitle type status contentFormat isLinkUnfurlingEnabled appendUnsubscribeLink isDeleted createdAt { iso8601 } updatedAt { iso8601 } scheduledAt { iso8601 } startedAt { iso8601 } completedAt { iso8601 } latestSend { $BROADCAST_SEND_FIELDS }"
 BROADCAST_DETAIL_FIELDS="$BROADCAST_SUMMARY_FIELDS content sender { $BROADCAST_SENDER_FIELDS } sendTarget { scope filters { $BROADCAST_FILTER_FIELDS } recipients { type slackTeamId slackChannelId } excludeRecipients { type slackTeamId slackChannelId } } reactions { emojiName count } deletedAt { iso8601 } createdBy { $BROADCAST_ACTOR_FIELDS } updatedBy { $BROADCAST_ACTOR_FIELDS }"
 
 BROADCAST_AUDIENCE_FIELDS="id name type isDeleted filters { $BROADCAST_FILTER_FIELDS } createdAt { iso8601 } updatedAt { iso8601 } deletedAt { iso8601 } createdBy { $BROADCAST_ACTOR_FIELDS } updatedBy { $BROADCAST_ACTOR_FIELDS }"
 
 BROADCAST_MUTATION_ERROR='error { message code fields { field message type } }'
+
+BROADCAST_UNSUBSCRIBE_FIELDS="id source broadcastSendDeliveryId recipient { __typename ... on SlackBroadcastRecipientUnsubscribeRecipient { slackTeamId slackChannelId connectedSlackChannel { id name isEnabled isPrivate } } } createdAt { iso8601 } createdBy { $BROADCAST_ACTOR_FIELDS } updatedAt { iso8601 }"
+
+# A broadcast's appendUnsubscribeLink is null when it inherits this. Nullable, so a
+# key without setting/workspace:read gets null here plus an error, not a failed query.
+BROADCAST_UNSUBSCRIBE_LINK_SETTING='workspaceAppendUnsubscribeLink: setting(code: "broadcasts/append_unsubscribe_link", scope: {scopeType: WORKSPACE}) { ... on BooleanSetting { booleanValue } }'
 
 broadcast_list() {
     local first=10
@@ -1076,7 +1093,7 @@ broadcast_get() {
         echo "Usage: plain-api.sh broadcast get bc_01..." >&2
         exit 1
     fi
-    gql "query(\$id: ID!) { broadcast(broadcastId: \$id) { $BROADCAST_DETAIL_FIELDS } }" \
+    gql "query(\$id: ID!) { broadcast(broadcastId: \$id) { $BROADCAST_DETAIL_FIELDS } $BROADCAST_UNSUBSCRIBE_LINK_SETTING }" \
         "{\"id\": \"$id\"}"
 }
 
@@ -1266,6 +1283,7 @@ broadcast_create() {
     local sender_type=""
     local sender_user=""
     local link_unfurling=""
+    local unsubscribe_link=""
     local all_tenants="false"
     local audiences=""
     local tiers=""
@@ -1282,6 +1300,7 @@ broadcast_create() {
             --sender-type) sender_type="$(upper "$2")"; shift 2 ;;
             --sender-user) sender_user="$2"; shift 2 ;;
             --link-unfurling) link_unfurling="$(parse_bool "$2" --link-unfurling)"; shift 2 ;;
+            --unsubscribe-link) unsubscribe_link="$(parse_bool_or_inherit "$2" --unsubscribe-link)"; shift 2 ;;
             --all-recipients|--all-tenants) all_tenants="true"; shift ;;
             --audience) audiences=$(append_line "$audiences" "$2"); shift 2 ;;
             --tier) tiers=$(append_line "$tiers" "$2"); shift 2 ;;
@@ -1335,6 +1354,7 @@ broadcast_create() {
         --arg senderType "$sender_type" \
         --arg senderUserId "$sender_user" \
         --arg linkUnfurling "$link_unfurling" \
+        --arg unsubscribeLink "$unsubscribe_link" \
         --argjson sendTarget "$send_target" \
         '{
             name: $name,
@@ -1345,6 +1365,7 @@ broadcast_create() {
             senderType: (if $senderType == "" then null else $senderType end),
             senderUserId: (if $senderUserId == "" then null else $senderUserId end),
             isLinkUnfurlingEnabled: (if $linkUnfurling == "" then null else ($linkUnfurling == "true") end),
+            appendUnsubscribeLink: (if $unsubscribeLink == "" or $unsubscribeLink == "inherit" then null else ($unsubscribeLink == "true") end),
             sendTarget: $sendTarget
         }
         | with_entries(select(.value != null))')
@@ -1363,6 +1384,7 @@ broadcast_update() {
     local sender_type=""
     local sender_user=""
     local link_unfurling=""
+    local unsubscribe_link=""
     local all_tenants="false"
     local audiences=""
     local tiers=""
@@ -1380,6 +1402,7 @@ broadcast_update() {
             --sender-type) sender_type="$(upper "$2")"; shift 2 ;;
             --sender-user) sender_user="$2"; shift 2 ;;
             --link-unfurling) link_unfurling="$(parse_bool "$2" --link-unfurling)"; shift 2 ;;
+            --unsubscribe-link) unsubscribe_link="$(parse_bool_or_inherit "$2" --unsubscribe-link)"; shift 2 ;;
             --all-recipients|--all-tenants) all_tenants="true"; set_target="true"; shift ;;
             --audience) audiences=$(append_line "$audiences" "$2"); set_target="true"; shift 2 ;;
             --tier) tiers=$(append_line "$tiers" "$2"); set_target="true"; shift 2 ;;
@@ -1442,6 +1465,7 @@ broadcast_update() {
         --arg senderType "$sender_type" \
         --arg senderUserId "$sender_user" \
         --arg linkUnfurling "$link_unfurling" \
+        --arg unsubscribeLink "$unsubscribe_link" \
         --argjson sendTarget "$send_target" \
         '{
             broadcastId: $broadcastId,
@@ -1452,6 +1476,11 @@ broadcast_update() {
             senderType: (if $senderType == "" then null else {value: $senderType} end),
             senderUserId: (if $senderUserId == "" then null else {value: $senderUserId} end),
             isLinkUnfurlingEnabled: (if $linkUnfurling == "" then null else {value: ($linkUnfurling == "true")} end),
+            appendUnsubscribeLink: (
+                if $unsubscribeLink == "" then null
+                elif $unsubscribeLink == "inherit" then {value: null}
+                else {value: ($unsubscribeLink == "true")} end
+            ),
             sendTarget: $sendTarget
         }
         | with_entries(select(.value != null))')
@@ -1469,6 +1498,65 @@ broadcast_delete() {
     fi
     gql "mutation(\$input: DeleteBroadcastInput!) { deleteBroadcast(input: \$input) { broadcast { id name isDeleted deletedAt { iso8601 } } $BROADCAST_MUTATION_ERROR } }" \
         "{\"input\": {\"broadcastId\": \"$id\"}}"
+}
+
+# Channels that opted out of broadcasts. These are dropped from every send, so this
+# is the list to check when a channel matched a target but got no message.
+broadcast_unsubscribes() {
+    local first=20
+    local after=""
+    local search=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --search) search="$2"; shift 2 ;;
+            --first) first="$2"; shift 2 ;;
+            --after) after="$2"; shift 2 ;;
+            --*) echo "Error: unknown option $1" >&2; exit 1 ;;
+            *) shift ;;
+        esac
+    done
+
+    local variables
+    variables=$(jq -n \
+        --argjson first "$first" \
+        --arg after "$after" \
+        --arg search "$search" \
+        '{
+            first: $first,
+            after: (if $after == "" then null else $after end),
+            search: (if $search == "" then null else $search end)
+        }')
+
+    gql "query(\$first: Int!, \$after: String, \$search: String) { broadcastRecipientUnsubscribes(searchQuery: \$search, first: \$first, after: \$after) { edges { cursor node { $BROADCAST_UNSUBSCRIBE_FIELDS } } pageInfo { hasNextPage endCursor } } }" \
+        "$variables"
+}
+
+# Shared by unsubscribe and resubscribe, which take the same input shape.
+broadcast_subscription_change() {
+    local mutation="$1"
+    local input_type="$2"
+    shift 2
+    local slack_team=""
+    local slack_channel=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --slack-team) slack_team="$2"; shift 2 ;;
+            --slack-channel) slack_channel="$2"; shift 2 ;;
+            *) echo "Error: unknown option $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [[ -z "$slack_team" ]] || [[ -z "$slack_channel" ]]; then
+        echo "Error: --slack-team and --slack-channel are required" >&2
+        echo "Usage: plain-api.sh broadcast ${mutation%BroadcastRecipient} --slack-team T01... --slack-channel C01..." >&2
+        exit 1
+    fi
+
+    gql "mutation(\$input: $input_type!) { $mutation(input: \$input) { unsubscribe { $BROADCAST_UNSUBSCRIBE_FIELDS } $BROADCAST_MUTATION_ERROR } }" \
+        "$(jq -n --arg team "$slack_team" --arg channel "$slack_channel" \
+            '{input: {type: "SLACK", slackTeamId: $team, slackChannelId: $channel}}')"
 }
 
 # ============================================================================
@@ -1682,6 +1770,8 @@ EXAMPLES:
   plain-api.sh broadcast deliveries bc_123 --status FAILED
   plain-api.sh broadcast recipients --tier tier_123
   plain-api.sh broadcast create --name "Launch" --text "We shipped it." --notification-title "We shipped it"
+  plain-api.sh broadcast unsubscribes --search eng
+  plain-api.sh broadcast resubscribe --slack-team T123 --slack-channel C123
 
   plain-api.sh audience list --search enterprise
   plain-api.sh audience create --name "Enterprise" --tier tier_123
@@ -1821,6 +1911,9 @@ main() {
                 create) broadcast_create "$@" ;;
                 update) broadcast_update "$@" ;;
                 delete) broadcast_delete "$@" ;;
+                unsubscribes) broadcast_unsubscribes "$@" ;;
+                unsubscribe) broadcast_subscription_change unsubscribeBroadcastRecipient UnsubscribeBroadcastRecipientInput "$@" ;;
+                resubscribe) broadcast_subscription_change resubscribeBroadcastRecipient ResubscribeBroadcastRecipientInput "$@" ;;
                 send|schedule|test)
                     echo "Error: broadcasts are not sent or scheduled from this skill - do it in the Plain app" >&2
                     exit 1 ;;

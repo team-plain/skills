@@ -1,6 +1,6 @@
 ---
 name: plain-support
-description: Access to Plain customer support platform. Read customers, threads, timeline, help center content, and broadcasts. Add notes to threads. Create, update, and publish help center articles. Draft broadcasts and manage broadcast audiences.
+description: Access to Plain customer support platform. Read customers, threads, timeline, help center content, and broadcasts. Add notes to threads. Create, update, and publish help center articles. Draft broadcasts, manage broadcast audiences, and manage broadcast unsubscribes.
 license: MIT
 compatibility: Requires curl, jq, and PLAIN_API_KEY environment variable
 metadata:
@@ -11,7 +11,7 @@ allowed-tools: Bash Read
 
 # Plain API Skill
 
-Access to the Plain customer support platform via GraphQL API. This skill provides commands to read customers, support threads, timeline entries, help center content, broadcasts, and more. Notes can be added to threads. Help center articles can be created, updated, and published directly. Broadcasts and broadcast audiences can be drafted and edited, but never scheduled or sent.
+Access to the Plain customer support platform via GraphQL API. This skill provides commands to read customers, support threads, timeline entries, help center content, broadcasts, and more. Notes can be added to threads. Help center articles can be created, updated, and published directly. Broadcasts and broadcast audiences can be drafted and edited, but never scheduled or sent. Channels can be unsubscribed from and resubscribed to broadcasts.
 
 ## Prerequisites
 
@@ -246,7 +246,8 @@ scripts/plain-api.sh broadcast list --first 10
 scripts/plain-api.sh broadcast list --status DRAFT
 scripts/plain-api.sh broadcast list --status SENT --status PARTIALLY_SENT
 
-# Get one broadcast, including content, sender and send target
+# Get one broadcast, including content, sender and send target. Also returns
+# workspaceAppendUnsubscribeLink, the workspace default for the unsubscribe link
 scripts/plain-api.sh broadcast get bc_01ABC...
 
 # Search by name (2+ characters)
@@ -258,6 +259,7 @@ scripts/plain-api.sh broadcast sends bc_01ABC... --real-only
 # Per-recipient results for the latest real send
 scripts/plain-api.sh broadcast deliveries bc_01ABC... --status FAILED
 scripts/plain-api.sh broadcast deliveries bc_01ABC... --send bcs_01ABC...
+scripts/plain-api.sh broadcast deliveries bc_01ABC... --status SKIPPED_UNSUBSCRIBED
 
 # Preview who a target reaches right now, before drafting anything
 scripts/plain-api.sh broadcast recipients --tier tier_01ABC...
@@ -289,6 +291,7 @@ scripts/plain-api.sh broadcast delete bc_01ABC...
 | `--sender-type` | No | `PLAIN_WORKSPACE` or `PLAIN_USER` (implied by `--sender-user`) |
 | `--sender-user` | No | User ID to post as |
 | `--link-unfurling` | No | `true` or `false` |
+| `--unsubscribe-link` | No | `true` or `false` overrides the workspace default for this broadcast. `inherit` clears the override |
 | `--all-recipients` | No | Target every connected customer channel (`ALL_RECIPIENTS`). `--all-tenants` is accepted as an alias |
 | `--tier` / `--tenant` / `--audience` / `--channel-name-contains` | No | Target dimensions. Repeatable, and they combine |
 | `--filters-file` | No | A filter tree with `and`/`or`/`not`, for anything the flags cannot express |
@@ -326,6 +329,28 @@ scripts/plain-api.sh audience delete ba_01ABC...
 **Warning:** `audience update` with any filter flag **replaces** the stored filters wholesale — there
 is no merge. Run `audience get` first and pass the whole tree back if you only mean to add a row.
 Editing an audience also changes who every broadcast using it will reach on its next send.
+
+### Broadcast Unsubscribes (Read + Write)
+
+An unsubscribed channel is dropped from **every** broadcast, whatever its target says. Customers
+unsubscribe through the link in a broadcast's footer. A Plain user can also do it on their behalf.
+
+```bash
+# List unsubscribed channels (newest first), optionally by channel name
+scripts/plain-api.sh broadcast unsubscribes --first 20
+scripts/plain-api.sh broadcast unsubscribes --search eng
+
+# Unsubscribe or resubscribe one Slack channel. Both are idempotent
+scripts/plain-api.sh broadcast unsubscribe --slack-team T01ABC... --slack-channel C01ABC...
+scripts/plain-api.sh broadcast resubscribe --slack-team T01ABC... --slack-channel C01ABC...
+```
+
+**Warning:** Resubscribing overrides a choice the customer may have made themselves. Check `source`
+on the unsubscribe first. `CUSTOMER_LINK` means the customer opted out. Only resubscribe when a human
+confirms the customer asked for it.
+
+`broadcast recipients` already leaves unsubscribed channels out, so a resubscribed channel shows up
+there again straight away.
 
 ### Tiers & SLAs (Read Only)
 
@@ -390,6 +415,16 @@ scripts/plain-api.sh workspace
 5. Confirm the draft: `broadcast get bc_...` (status stays `DRAFT`)
 6. Hand the broadcast ID to a human — scheduling and sending happen in the Plain app
 
+### Find out why a channel did not get a broadcast
+
+1. List the latest real send's deliveries: `broadcast deliveries bc_...`. Find the row whose
+   `recipient.slackChannelId` matches
+2. `SKIPPED_UNSUBSCRIBED` means the channel matched the target but is unsubscribed. Confirm with
+   `broadcast unsubscribes --search <channel name>`
+3. `FAILED` means it matched and posting failed. `failureReason` says why
+4. No delivery at all means the target never matched the channel. Check
+   `broadcast recipients` with the same target
+
 ## Entity Reference
 
 See [references/ENTITIES.md](references/ENTITIES.md) for detailed documentation on all entities including:
@@ -404,6 +439,7 @@ See [references/ENTITIES.md](references/ENTITIES.md) for detailed documentation 
 - Broadcast fields, statuses, and the Tiptap content format
 - BroadcastSend and delivery statuses, including failure reasons
 - BroadcastAudience filter trees and send targets
+- BroadcastRecipientUnsubscribe fields and sources, and the unsubscribe link setting
 
 ## Environment Variables
 
