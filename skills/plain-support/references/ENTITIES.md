@@ -531,6 +531,56 @@ error, not an empty list — do not read "no broadcasts" into it.
 
 ---
 
+## Dashboard
+
+A saved page of charts and text widgets. One `globalRange` applies to every chart that does not set
+its own `rangeOverride`. Widgets come back ordered by `position`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | ID | Dashboard identifier (e.g., `dash_01ABC...`) |
+| `name` | String | Display name, 1–500 characters |
+| `globalRange` | Union | `DashboardPresetRange` (`duration` in days: 1, 7, 30, 60, 120, 182, or 365) or `DashboardCustomRange` (`from`, `to`, ISO 8601 with an offset, `from` before `to`). A new dashboard defaults to 30 days |
+| `widgets` | [Widget] | Present on `dashboard get`, omitted from `dashboard list` |
+| `createdAt` / `createdBy` | | When and by whom |
+| `updatedAt` / `updatedBy` | | When and by whom |
+
+`createdBy` and `updatedBy` are an `InternalActor`: `UserActor` (`userId`), `MachineUserActor`
+(`machineUserId`), or `SystemActor` (`systemId`).
+
+### DashboardWidget
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | ID | Widget identifier. Send it back as `widgetId` to keep the widget on update |
+| `kind` | Enum | `TIMESERIES`, `STAT`, `HEATMAP`, `BREAKDOWN`, or `MARKDOWN` |
+| `chartType` | Enum | `BAR`, `LINE`, or `STACKED_BAR` for `TIMESERIES`. Null for every other kind |
+| `config` | Union | `DashboardChartWidgetConfig` or `DashboardMarkdownWidgetConfig` |
+| `layout` | Layout | `x` is the column (`0`, `1`, or `2`). `width` is always `1` |
+| `position` | Int | Order on the page. On write, this is the array index, not a field |
+
+A chart config carries `catalogueEntryId` (a label, not a lookup), `metrics`, an optional
+`keyMetric`, `valueType` (`COUNT`, `TIME`, or `PERCENTAGE`), optional `theme`, `title`,
+`description`, `filters`, and `rangeOverride`. A markdown config carries `markdown` (at most 5000
+characters, may be empty).
+
+On a **read**, `filters` is a JSON string of the saved `ThreadMetricFilters`, and a metric is a
+union: `DashboardTimeSeriesWidgetMetric`, `DashboardSingleValueWidgetMetric`, or
+`DashboardHeatmapWidgetMetric`, each with `name` and optional `groupBy`, `percentile`,
+`machineUsers` (`INCLUDE`, `EXCLUDE`, `ONLY`), plus `interval` on a time series. On a **write**,
+the shape is different. See the Dashboards section of [SKILL.md](../SKILL.md).
+
+At most 50 widgets. `dashboard update` with a widgets file replaces the set: omitted ids are
+deleted.
+
+### Permissions
+
+Dashboard commands need an API key with `dashboard:read`, `dashboard:create`, `dashboard:edit`, or
+`dashboard:delete`. The workspace must have custom dashboards enabled. A key missing a permission,
+or a workspace without the feature, returns an error rather than an empty list.
+
+---
+
 ## DateTime Format
 
 All datetime fields return an object with:
