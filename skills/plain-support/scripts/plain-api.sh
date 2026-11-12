@@ -1717,6 +1717,226 @@ audience_delete() {
 }
 
 # ============================================================================
+# DASHBOARDS (READ + WRITE)
+# ============================================================================
+#
+# update --widgets-file replaces the dashboard's widgets. The file is the
+# mutation input, not the shape `dashboard get` returns: filters there are a
+# JSON string, and each metric is a union. The input wraps a metric in exactly
+# one of timeSeries, singleValue or heatmap, and filters are an object.
+
+# DashboardRangeInput, or null when the caller set no range. Preset and custom
+# are mutually exclusive; a custom range needs both ends.
+dashboard_range_input() {
+    local preset="$1"
+    local from="$2"
+    local to="$3"
+
+    if [[ -n "$preset" ]] && { [[ -n "$from" ]] || [[ -n "$to" ]]; }; then
+        echo "Error: --preset cannot be combined with --from/--to" >&2
+        exit 1
+    fi
+    if [[ -n "$from" ]] || [[ -n "$to" ]]; then
+        if [[ -z "$from" ]] || [[ -z "$to" ]]; then
+            echo "Error: --from and --to are both required for a custom range" >&2
+            exit 1
+        fi
+        jq -cn --arg from "$from" --arg to "$to" '{custom: {from: $from, to: $to}}'
+        return
+    fi
+    if [[ -z "$preset" ]]; then
+        printf 'null'
+        return
+    fi
+    case "$preset" in
+        1|7|30|60|120|182|365) ;;
+        *) echo "Error: --preset must be one of 1, 7, 30, 60, 120, 182, 365 (days), got '$preset'" >&2; exit 1 ;;
+    esac
+    jq -cn --argjson duration "$preset" '{preset: {duration: $duration}}'
+}
+
+# A JSON array of DashboardWidgetInput. An empty array is valid and clears widgets.
+read_dashboard_widgets_file() {
+    local path="$1"
+    local doc
+    doc=$(read_json_file "$path")
+    if ! printf '%s' "$doc" | jq -e 'type == "array"' >/dev/null; then
+        echo "Error: $path must be a JSON array of dashboard widgets" >&2
+        exit 1
+    fi
+    printf '%s' "$doc"
+}
+
+# Adds .link when the response contains a dashboard id. The workspace lookup is
+# skipped when the mutation failed, so an error response is returned unchanged.
+attach_dashboard_link() {
+    local result="$1"
+    local id
+    id=$(printf '%s' "$result" | jq -r "$2 // empty" 2>/dev/null || true)
+    if [[ -z "$id" ]] || [[ "$id" == "null" ]]; then
+        printf '%s\n' "$result"
+        return
+    fi
+    local workspace_id
+    workspace_id=$(gql '{ myWorkspace { id } }' '{}' | jq -r '.data.myWorkspace.id // empty')
+    if [[ -z "$workspace_id" ]]; then
+        printf '%s\n' "$result"
+        return
+    fi
+    local link="https://app.plain.com/workspace/${workspace_id}/insights/dashboards/${id}"
+    printf '%s' "$result" | jq --arg link "$link" '.link = $link'
+}
+
+DASHBOARD_ACTOR_FIELDS='__typename ... on UserActor { userId } ... on MachineUserActor { machineUserId } ... on SystemActor { systemId }'
+DASHBOARD_RANGE_FIELDS='__typename ... on DashboardPresetRange { duration } ... on DashboardCustomRange { from to }'
+DASHBOARD_METRIC_FIELDS='__typename ... on DashboardTimeSeriesWidgetMetric { name interval { unit } groupBy { dimension subKey topN } seriesLabel colorTransform percentile filters machineUsers } ... on DashboardSingleValueWidgetMetric { name groupBy { dimension subKey topN } seriesLabel colorTransform percentile filters machineUsers } ... on DashboardHeatmapWidgetMetric { name seriesLabel colorTransform filters machineUsers }'
+DASHBOARD_WIDGET_FIELDS="id kind chartType position layout { x width } config { __typename ... on DashboardChartWidgetConfig { catalogueEntryId valueType theme title description filters rangeOverride { $DASHBOARD_RANGE_FIELDS } keyMetric { name percentile machineUsers } metrics { $DASHBOARD_METRIC_FIELDS } } ... on DashboardMarkdownWidgetConfig { markdown } }"
+DASHBOARD_SUMMARY_FIELDS="id name globalRange { $DASHBOARD_RANGE_FIELDS } createdAt { iso8601 } updatedAt { iso8601 } createdBy { $DASHBOARD_ACTOR_FIELDS } updatedBy { $DASHBOARD_ACTOR_FIELDS }"
+DASHBOARD_DETAIL_FIELDS="$DASHBOARD_SUMMARY_FIELDS widgets { $DASHBOARD_WIDGET_FIELDS }"
+DASHBOARD_MUTATION_ERROR='error { message code fields { field message type } }'
+
+dashboard_list() {
+    local first=20
+    local after=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --first) first="$2"; shift 2 ;;
+            --after) after="$2"; shift 2 ;;
+            --*) echo "Error: unknown option $1" >&2; exit 1 ;;
+            *) shift ;;
+        esac
+    done
+
+    local variables
+    variables=$(jq -n --argjson first "$first" --arg after "$after" \
+        '{first: $first, after: (if $after == "" then null else $after end)}')
+
+    gql "query(\$first: Int!, \$after: String) { dashboards(first: \$first, after: \$after) { edges { cursor node { $DASHBOARD_SUMMARY_FIELDS } } pageInfo { hasNextPage endCursor } } }" \
+        "$variables"
+}
+
+dashboard_get() {
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        echo "Error: dashboard_id is required" >&2
+        echo "Usage: plain-api.sh dashboard get dash_01..." >&2
+        exit 1
+    fi
+    local result
+    result=$(gql "query(\$id: ID!) { dashboard(dashboardId: \$id) { $DASHBOARD_DETAIL_FIELDS } }" \
+        "$(jq -n --arg id "$id" '{id: $id}')")
+    attach_dashboard_link "$result" '.data.dashboard.id'
+}
+
+dashboard_create() {
+    local name=""
+    local preset=""
+    local from=""
+    local to=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name) name="$2"; shift 2 ;;
+            --preset) preset="$2"; shift 2 ;;
+            --from) from="$2"; shift 2 ;;
+            --to) to="$2"; shift 2 ;;
+            --*) echo "Error: unknown option $1" >&2; exit 1 ;;
+            *) echo "Error: unexpected argument $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        echo "Error: --name is required" >&2
+        echo "Usage: plain-api.sh dashboard create --name \"Weekly ops\" [--preset 30]" >&2
+        exit 1
+    fi
+
+    local range
+    range=$(dashboard_range_input "$preset" "$from" "$to") || exit 1
+
+    local input
+    input=$(jq -n --arg name "$name" --argjson globalRange "$range" \
+        '{name: $name, globalRange: $globalRange} | with_entries(select(.value != null))')
+
+    local result
+    result=$(gql "mutation(\$input: CreateDashboardInput!) { createDashboard(input: \$input) { dashboard { $DASHBOARD_DETAIL_FIELDS } $DASHBOARD_MUTATION_ERROR } }" \
+        "$(jq -n --argjson input "$input" '{input: $input}')")
+    attach_dashboard_link "$result" '.data.createDashboard.dashboard.id'
+}
+
+dashboard_update() {
+    local id=""
+    local name=""
+    local preset=""
+    local from=""
+    local to=""
+    local widgets_file=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --name) name="$2"; shift 2 ;;
+            --preset) preset="$2"; shift 2 ;;
+            --from) from="$2"; shift 2 ;;
+            --to) to="$2"; shift 2 ;;
+            --widgets-file) widgets_file="$2"; shift 2 ;;
+            '') shift ;;
+            --*) echo "Error: unknown option $1" >&2; exit 1 ;;
+            *) id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Error: dashboard_id is required" >&2
+        echo "Usage: plain-api.sh dashboard update dash_01... [--name ...] [--preset 30] [--widgets-file widgets.json]" >&2
+        exit 1
+    fi
+
+    local range
+    range=$(dashboard_range_input "$preset" "$from" "$to") || exit 1
+
+    if [[ -z "$name" ]] && [[ "$range" == "null" ]] && [[ -z "$widgets_file" ]]; then
+        echo "Error: pass --name, a range (--preset or --from/--to), or --widgets-file" >&2
+        exit 1
+    fi
+
+    local widgets="null"
+    if [[ -n "$widgets_file" ]]; then
+        widgets=$(read_dashboard_widgets_file "$widgets_file") || exit 1
+    fi
+
+    local input
+    input=$(jq -n \
+        --arg dashboardId "$id" \
+        --arg name "$name" \
+        --argjson globalRange "$range" \
+        --argjson widgets "$widgets" \
+        '{
+            dashboardId: $dashboardId,
+            name: (if $name == "" then null else $name end),
+            globalRange: $globalRange,
+            widgets: $widgets
+        }
+        | with_entries(select(.value != null))')
+
+    local result
+    result=$(gql "mutation(\$input: UpdateDashboardInput!) { updateDashboard(input: \$input) { dashboard { $DASHBOARD_DETAIL_FIELDS } $DASHBOARD_MUTATION_ERROR } }" \
+        "$(jq -n --argjson input "$input" '{input: $input}')")
+    attach_dashboard_link "$result" '.data.updateDashboard.dashboard.id'
+}
+
+dashboard_delete() {
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        echo "Error: dashboard_id is required" >&2
+        echo "Usage: plain-api.sh dashboard delete dash_01..." >&2
+        exit 1
+    fi
+    gql "mutation(\$input: DeleteDashboardInput!) { deleteDashboard(input: \$input) { deletedDashboardId $DASHBOARD_MUTATION_ERROR } }" \
+        "$(jq -n --arg dashboardId "$id" '{input: {dashboardId: $dashboardId}}')"
+}
+
+# ============================================================================
 # WORKSPACE (READ ONLY)
 # ============================================================================
 
@@ -1744,6 +1964,7 @@ RESOURCES:
   broadcast     Read + draft broadcasts (never schedules or sends)
   audience      Read + write broadcast audiences
   tier          Read tiers and SLAs
+  dashboard     Read + write custom dashboards
   workspace     Get workspace info
 
 EXAMPLES:
@@ -1778,6 +1999,13 @@ EXAMPLES:
   plain-api.sh audience update ba_123 --name "Enterprise (EU)"
 
   plain-api.sh tier list
+
+  plain-api.sh dashboard list
+  plain-api.sh dashboard get dash_123
+  plain-api.sh dashboard create --name "Weekly ops" --preset 30
+  plain-api.sh dashboard update dash_123 --widgets-file widgets.json
+  plain-api.sh dashboard delete dash_123
+
   plain-api.sh workspace
 
 NOTE:
@@ -1939,6 +2167,18 @@ main() {
                 list) tier_list "$@" ;;
                 get) tier_get "$@" ;;
                 *) echo "Unknown tier action: $action" >&2; exit 1 ;;
+            esac
+            ;;
+        dashboard)
+            local action="${1:-list}"
+            shift || true
+            case "$action" in
+                list) dashboard_list "$@" ;;
+                get) dashboard_get "$@" ;;
+                create) dashboard_create "$@" ;;
+                update) dashboard_update "$@" ;;
+                delete) dashboard_delete "$@" ;;
+                *) echo "Unknown dashboard action: $action" >&2; exit 1 ;;
             esac
             ;;
         workspace)

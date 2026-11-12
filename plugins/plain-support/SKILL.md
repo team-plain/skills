@@ -1,17 +1,17 @@
 ---
 name: plain-support
-description: Access to Plain customer support platform. Read customers, threads, timeline, help center content, and broadcasts. Add notes to threads. Create, update, and publish help center articles. Draft broadcasts, manage broadcast audiences, and manage broadcast unsubscribes.
+description: Access to Plain customer support platform. Read customers, threads, timeline, help center content, broadcasts, and custom dashboards. Add notes to threads. Create, update, and publish help center articles. Draft broadcasts, manage broadcast audiences, and manage broadcast unsubscribes. Create, update, and delete custom dashboards.
 license: MIT
 compatibility: Requires curl, jq, and PLAIN_API_KEY environment variable
 metadata:
   author: plain
-  version: "2.4"
+  version: "2.5"
 allowed-tools: Bash Read
 ---
 
 # Plain API Skill
 
-Access to the Plain customer support platform via GraphQL API. This skill provides commands to read customers, support threads, timeline entries, help center content, broadcasts, and more. Notes can be added to threads. Help center articles can be created, updated, and published directly. Broadcasts and broadcast audiences can be drafted and edited, but never scheduled or sent. Channels can be unsubscribed from and resubscribed to broadcasts.
+Access to the Plain customer support platform via GraphQL API. This skill provides commands to read customers, support threads, timeline entries, help center content, broadcasts, custom dashboards, and more. Notes can be added to threads. Help center articles can be created, updated, and published directly. Broadcasts and broadcast audiences can be drafted and edited, but never scheduled or sent. Channels can be unsubscribed from and resubscribed to broadcasts. Custom dashboards can be listed, created, updated, and deleted.
 
 ## Prerequisites
 
@@ -352,6 +352,116 @@ confirms the customer asked for it.
 `broadcast recipients` already leaves unsubscribed channels out, so a resubscribed channel shows up
 there again straight away.
 
+### Dashboards (Read + Write)
+
+A dashboard is a saved layout of charts and text widgets, with one time range for the whole page.
+Charts can override that range. The workspace must have custom dashboards enabled, and the API key
+needs `dashboard:read`, `dashboard:create`, `dashboard:edit`, or `dashboard:delete` for the command
+it runs. A workspace without the feature returns a not-implemented error rather than an empty list.
+
+```bash
+# List dashboards (newest page via cursor)
+scripts/plain-api.sh dashboard list --first 20
+scripts/plain-api.sh dashboard list --after "cursor_from_previous_page"
+
+# Get one dashboard, including its widgets. Also returns a link to it in the Plain app
+scripts/plain-api.sh dashboard get dash_01ABC...
+
+# Create. Range defaults to the last 30 days when omitted
+scripts/plain-api.sh dashboard create --name "Weekly ops"
+scripts/plain-api.sh dashboard create --name "Today" --preset 1
+scripts/plain-api.sh dashboard create --name "Launch week" \
+  --from "2026-03-01T00:00:00Z" \
+  --to "2026-03-08T00:00:00Z"
+
+# Rename, or change the range. Omitted flags are left alone
+scripts/plain-api.sh dashboard update dash_01ABC... --name "Weekly ops (EU)"
+scripts/plain-api.sh dashboard update dash_01ABC... --preset 7
+
+# Replace the full widget set. See the warning below
+scripts/plain-api.sh dashboard update dash_01ABC... --widgets-file /tmp/widgets.json
+
+# Delete the dashboard and its widgets
+scripts/plain-api.sh dashboard delete dash_01ABC...
+```
+
+**Dashboard create/update options:**
+| Option | Required | Description |
+|--------|----------|-------------|
+| `--name` | Yes (create) | Dashboard name, 1–500 characters |
+| `--preset` | No | Range ending now, in days: `1`, `7`, `30`, `60`, `120`, `182`, or `365` |
+| `--from` / `--to` | No | Custom range. Both required together. ISO 8601 timestamps with an offset (`Z` or `+00:00`). `from` must be before `to` |
+| `--widgets-file` | No | Path to a JSON array of widgets. **Update only.** Replaces every widget |
+
+`--preset` cannot be combined with `--from`/`--to`.
+
+**Warning:** `dashboard update --widgets-file` **replaces** the stored widgets. Widgets whose ids
+are missing from the file are deleted, a widget without `widgetId` is created, and array order is
+the new position. There is no merge. Run `dashboard get` first. Omit `--widgets-file` to leave
+widgets untouched. An empty array (`[]`) clears them.
+
+The file is the mutation input, not the JSON `dashboard get` returns. On a read, `filters` is a
+JSON string and each metric is a union (`__typename` plus `name`). On a write, set exactly one of
+`content.chart` or `content.markdown`, wrap each metric in exactly one of `timeSeries`,
+`singleValue`, or `heatmap`, and pass `filters` as an object.
+
+```json
+[
+  {
+    "content": {
+      "chart": {
+        "kind": "TIMESERIES",
+        "chartType": "LINE",
+        "config": {
+          "catalogueEntryId": "threads_created",
+          "metrics": [
+            {
+              "timeSeries": {
+                "name": "threads_created_count",
+                "interval": { "unit": "DAY" },
+                "machineUsers": "EXCLUDE"
+              }
+            }
+          ],
+          "valueType": "COUNT",
+          "title": "New threads",
+          "filters": { "priorities": [0, 1] }
+        }
+      }
+    },
+    "layout": { "x": 0, "width": 1 }
+  },
+  {
+    "widgetId": "dw_01ABC...",
+    "layout": { "x": 1, "width": 1 }
+  },
+  {
+    "content": { "markdown": { "markdown": "## This week\n\nWatch urgent volume." } },
+    "layout": { "x": 2, "width": 1 }
+  }
+]
+```
+
+**Widget rules:**
+- At most 50 widgets. `layout.width` is always `1`. `layout.x` is `0`, `1`, or `2`.
+- `TIMESERIES` requires `chartType` (`BAR`, `LINE`, or `STACKED_BAR`) and a `timeSeries` metric.
+- `STAT` takes a `singleValue` metric. `HEATMAP` takes a `heatmap` metric. `BREAKDOWN` takes
+  `timeSeries` or `singleValue`. Those three kinds omit `chartType`.
+- `MARKDOWN` is `content.markdown` and no chart. Markdown may be empty and is at most 5000 characters.
+- `catalogueEntryId` is a label (1–255 characters). The chart renders from `metrics`, not from it.
+- A metric `name` is a thread metric name such as `threads_created_count`. `machineUsers` is
+  `INCLUDE`, `EXCLUDE`, or `ONLY`; omit it to keep the metric's default.
+- To keep an existing widget's content and only move it, send `widgetId` and `layout` and omit `content`.
+
+Create and update responses include a `link` to the dashboard in the Plain app when they succeed:
+
+```json
+{
+  "data": { ... },
+  "link": "https://app.plain.com/workspace/w_01.../insights/dashboards/dash_01..."
+}
+```
+
 ### Tiers & SLAs (Read Only)
 
 ```bash
@@ -415,6 +525,16 @@ scripts/plain-api.sh workspace
 5. Confirm the draft: `broadcast get bc_...` (status stays `DRAFT`)
 6. Hand the broadcast ID to a human — scheduling and sending happen in the Plain app
 
+### Build a dashboard
+
+1. Create it: `dashboard create --name "Weekly ops" --preset 30`
+2. Write the widget array (see Dashboards above) to `/tmp/widgets.json`
+3. Save it: `dashboard update dash_... --widgets-file /tmp/widgets.json`
+4. Open the returned `link`, or fetch it back: `dashboard get dash_...`
+
+To change one chart, `dashboard get` the current widgets, rebuild the **input** array (do not paste
+the response back), and send the whole array again.
+
 ### Find out why a channel did not get a broadcast
 
 1. List the latest real send's deliveries: `broadcast deliveries bc_...`. Find the row whose
@@ -440,6 +560,7 @@ See [references/ENTITIES.md](references/ENTITIES.md) for detailed documentation 
 - BroadcastSend and delivery statuses, including failure reasons
 - BroadcastAudience filter trees and send targets
 - BroadcastRecipientUnsubscribe fields and sources, and the unsubscribe link setting
+- Dashboard fields, ranges, and widget config
 
 ## Environment Variables
 
