@@ -1,0 +1,43 @@
+name: Publish skill discovery
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: skill-discovery
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test discovery build
+        run: python3 scripts/test-discovery.py
+      - name: Build discovery files
+        run: python3 scripts/build-discovery.py
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="discovery-${GITHUB_SHA}"
+          if gh release view "$tag" --json isDraft --jq .isDraft > /dev/null 2>&1; then
+            if [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = false ]; then
+              exit 0
+            fi
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --title "Skill discovery ${GITHUB_SHA}" --draft
+          fi
+          gh release upload "$tag" dist/discovery/index.json dist/discovery/plain-support.tar.gz --clobber
+          if [ "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA" ]; then
+            gh release edit "$tag" --draft=false --latest
+          else
+            gh release edit "$tag" --draft=false --latest=false
+          fi

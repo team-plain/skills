@@ -96,6 +96,19 @@ Claude will then have access to all Plain API commands. You can ask questions na
 - "Show me the timeline for thread th_01H..."
 - "Create a draft article about our refund policy"
 
+## Skill discovery
+
+Each update to `main` publishes a GitHub release containing the Plain Support skill archive and
+its discovery index. The current files are available at:
+
+- https://github.com/team-plain/skills/releases/latest/download/index.json
+- https://github.com/team-plain/skills/releases/latest/download/plain-support.tar.gz
+
+The index points to the archive in its own commit-specific release, so its digest remains valid
+when a newer release is published. To check the build locally, run
+`GITHUB_SHA=$(git rev-parse HEAD) python3 scripts/build-discovery.py` and
+`python3 scripts/test-discovery.py`. Generated files are written to `dist/discovery/`.
+
 ## License
 
 MIT
