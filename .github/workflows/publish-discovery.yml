@@ -33,7 +33,7 @@ jobs:
               exit 0
             fi
           else
-            gh release create "$tag" --target "$GITHUB_SHA" --title "Skill discovery ${GITHUB_SHA}" --draft
+            gh release create "$tag" --target "$GITHUB_SHA" --title "Skill - ${GITHUB_SHA:0:7}" --draft
           fi
           gh release upload "$tag" dist/discovery/index.json dist/discovery/plain-support.tar.gz --clobber
           if [ "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA" ]; then
